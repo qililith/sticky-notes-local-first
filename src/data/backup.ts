@@ -103,8 +103,19 @@ export async function importBackup(ownerId: string, archive: BackupArchive): Pro
     const fingerprint = JSON.stringify(notePayload(source))
     noteMap.set(source.id, await stableImportId(ownerId, archive.sourceAccount, 'note', `${source.id}\0${fingerprint}`))
   }
-  const conflictMap = new Map<string, string>()
-  for (const source of archive.conflicts) if (source.entity === 'note') conflictMap.set(source.id, await stableImportId(ownerId, archive.sourceAccount, 'conflict', source.id))
+  const conflictMap = new Map<string, { id: string; legacyId: string }>()
+  for (const source of archive.conflicts) {
+    if (source.entity !== 'note') continue
+    const remote = source.remote as Note
+    if (!remote?.doc || typeof remote.title !== 'string') continue
+    // A conflict ID stays the same while newer remote versions are pulled.
+    // Deduplicate each snapshot, not every version of that conflict together.
+    const fingerprint = JSON.stringify(notePayload(remote))
+    conflictMap.set(source.id, {
+      id: await stableImportId(ownerId, archive.sourceAccount, 'conflict', `${source.id}\0${fingerprint}`),
+      legacyId: await stableImportId(ownerId, archive.sourceAccount, 'conflict', source.id)
+    })
+  }
   await db.transaction('rw', db.notes, db.folders, db.outbox, db.history, async () => {
     if (isAccountSyncPaused(ownerId)) throw new Error('本机账号数据已清除，请重新登录')
     for (const source of archive.folders) {
@@ -146,9 +157,11 @@ export async function importBackup(ownerId: string, archive: BackupArchive): Pro
       if (source.entity !== 'note') continue
       const remote = source.remote as Note
       if (!remote?.doc || typeof remote.title !== 'string') continue
-      const newId = conflictMap.get(source.id)!
+      const { id: newId, legacyId } = conflictMap.get(source.id)!
       if (await db.notes.get(newId)) continue
       const note: Note = { ...remote, id: newId, ownerId, title: titleWithSuffix(remote.title, '（冲突副本）'), folderId: null, deletedAt: null, localRev: 1, serverVersion: 0, confirmedRev: 0 }
+      const legacy = await db.notes.get(legacyId)
+      if (legacy?.ownerId === ownerId && JSON.stringify(notePayload(legacy)) === JSON.stringify(notePayload(note))) continue
       await db.notes.add(note)
       await db.outbox.add({ id: crypto.randomUUID(), ownerId, entity: 'note', entityId: newId, baseVersion: 0, localRev: 1, payload: notePayload(note), createdAt: new Date().toISOString(), state: 'pending' })
       addedNotes++; copies++
@@ -164,4 +177,3 @@ export async function importBackup(ownerId: string, archive: BackupArchive): Pro
   })
   return { notes: addedNotes, folders: addedFolders, copies }
 }
-

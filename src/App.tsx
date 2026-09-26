@@ -2,7 +2,8 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } fro
 import { useLiveQuery } from 'dexie-react-hooks'
 import { ArrowLeft, Check, ChevronDown, ChevronRight, Database, FileText, GripVertical, LogOut, Menu, Moon, Pencil, Pin, Plus, Search, StickyNote, Sun, Trash2, User, X } from 'lucide-react'
 import { toast, Toaster } from 'sonner'
-import { demoMode, forgetAccount, getRememberedAccount, rememberAccount, supabase } from './auth'
+import type { User as AuthUser } from '@supabase/supabase-js'
+import { accountKey, demoMode, forgetAccount, getRememberedAccount, rememberAccount, supabase } from './auth'
 import { db } from './data/db'
 import { accountClearedEventKey, isAccountSyncPaused, resumeAccountSync } from './data/accountSyncGate'
 import { MAX_FOLDER_NAME_LENGTH } from './data/limits'
@@ -102,7 +103,7 @@ function NotesWorkspace({ account, onLogout, sessionEnded, onDiscardDraft }: { a
     return () => window.removeEventListener('beforeunload', warnOnClose)
   }, [hasUnsavedDraft])
   useEffect(() => () => setUnresolvedEditorDraft(false), [])
-  useEffect(() => demoMode ? undefined : startSync(account.id), [account.id])
+  useEffect(() => demoMode || sessionEnded ? undefined : startSync(account.id), [account.id, sessionEnded])
   useEffect(() => {
     const media = window.matchMedia('(max-width: 640px)')
     const changed = () => { setIsMobile(media.matches); if (!media.matches) setSidebarOpen(false) }
@@ -204,6 +205,7 @@ export function App() {
   const [loading, setLoading] = useState(!demoMode)
   const [sessionEnded, setSessionEnded] = useState(false)
   const accountRef = useRef(account)
+  const completeLogin = useRef<((user: AuthUser) => void) | null>(null)
   accountRef.current = account
 
   useEffect(() => {
@@ -221,8 +223,10 @@ export function App() {
   useEffect(() => {
     const clearedElsewhere = (event: StorageEvent) => {
       const current = accountRef.current
-      if (!current || event.key !== accountClearedEventKey(current.id) || !event.newValue) return
-      forgetAccount()
+      const cleared = current && event.key === accountClearedEventKey(current.id) && event.newValue
+      const signedOut = event.key === accountKey && event.newValue === null && !getRememberedAccount()
+      if (!current || !cleared && !signedOut) return
+      if (getRememberedAccount()?.id === current.id) forgetAccount()
       if (hasPendingEditorWrites() || hasUnresolvedEditorDraft()) setSessionEnded(true)
       else { setSessionEnded(false); setAccount(null) }
     }
@@ -244,32 +248,89 @@ export function App() {
     if (demoMode) return
     let active = true
     const remembered = getRememberedAccount()
-    if (!navigator.onLine && remembered) { if (!isAccountSyncPaused(remembered.id)) setAccount(remembered); setLoading(false); return }
-    if (!supabase) { setLoading(false); return }
+    // This hint opens only the local cache; the sync engine still checks the real session.
+    if (remembered && !isAccountSyncPaused(remembered.id)) {
+      accountRef.current = remembered
+      setAccount(remembered)
+    }
+    setLoading(false)
+    const client = supabase
+    if (!client) return
     let authRevision = 0
-    void supabase.auth.getUser().then(({ data, error }) => {
-      if (!active || authRevision) return
-      if (data.user && !error && !isAccountSyncPaused(data.user.id)) { rememberAccount(data.user); setAccount({ id: data.user.id, email: data.user.email ?? '' }) }
-      setLoading(false)
-    }).catch(() => { if (active && !authRevision) { if (remembered && !isAccountSyncPaused(remembered.id)) setAccount(remembered); setLoading(false) } })
-    const { data: subscription } = supabase.auth.onAuthStateChange((event, session) => {
+    let verificationId = 0
+    let verificationAllowed = true
+    let verificationPending = false
+    let eventTimer: number | undefined
+    const lock = () => {
+      verificationAllowed = false
+      forgetAccount()
+      if (hasPendingEditorWrites() || hasUnresolvedEditorDraft()) setSessionEnded(true)
+      else { accountRef.current = null; setSessionEnded(false); setAccount(null) }
+    }
+    const accept = (user: AuthUser) => {
+      if (isAccountSyncPaused(user.id)) return
+      if (accountRef.current && accountRef.current.id !== user.id && (hasPendingEditorWrites() || hasUnresolvedEditorDraft())) {
+        lock(); return
+      }
+      rememberAccount(user)
+      accountRef.current = { id: user.id, email: user.email ?? '' }
+      setSessionEnded(false)
+      setAccount(accountRef.current)
+    }
+    const verify = async () => {
+      if (!active || !navigator.onLine || !verificationAllowed || verificationPending) return
+      const hint = getRememberedAccount()
+      if (!hint || isAccountSyncPaused(hint.id)) return
+      const revision = authRevision
+      const requestId = ++verificationId
+      verificationPending = true
+      try {
+        const { data, error } = await client.auth.getUser()
+        if (!active || revision !== authRevision || requestId !== verificationId || getRememberedAccount()?.id !== hint.id) return
+        if (data.user && !error) accept(data.user)
+        else if (!error || error.name === 'AuthSessionMissingError' || error.status === 401 || error.status === 403
+          || ['user_banned', 'user_not_found', 'session_not_found', 'refresh_token_not_found', 'refresh_token_already_used'].includes(error.code ?? '')) {
+          lock()
+        }
+        // Transient/unknown failures leave the local workspace open. Never delete its data.
+      } catch { /* A transport failure is not proof that this account was signed out. */ }
+      finally { if (requestId === verificationId) verificationPending = false }
+    }
+    const retry = () => { void verify() }
+    const signedIn = (user: AuthUser) => {
+      authRevision += 1
+      verificationId += 1
+      verificationPending = false
+      verificationAllowed = true
+      accept(user)
+      // Defer nested auth work until this state-change callback has returned.
+      window.clearTimeout(eventTimer)
+      eventTimer = window.setTimeout(retry, 0)
+    }
+    completeLogin.current = signedIn
+    const { data: subscription } = client.auth.onAuthStateChange((event, session) => {
       if (!active) return
       if (event === 'SIGNED_OUT') {
-        authRevision += 1; setLoading(false)
-        forgetAccount()
-        if (hasPendingEditorWrites() || hasUnresolvedEditorDraft()) setSessionEnded(true)
-        else { setSessionEnded(false); setAccount(null) }
+        authRevision += 1
+        lock()
       }
-      if (event === 'SIGNED_IN' && session?.user) {
-        authRevision += 1; setLoading(false)
-        if (isAccountSyncPaused(session.user.id)) return
-        if (accountRef.current && accountRef.current.id !== session.user.id && (hasPendingEditorWrites() || hasUnresolvedEditorDraft())) {
-          forgetAccount(); setSessionEnded(true); return
-        }
-        rememberAccount(session.user); setSessionEnded(false); setAccount({ id: session.user.id, email: session.user.email ?? '' })
-      }
+      // A leftover SDK session must not undo a local lock, including on an offline reload.
+      // An explicit form login reopens this device through completeLogin below.
+      if (event === 'SIGNED_IN' && session?.user && getRememberedAccount()) signedIn(session.user)
     })
-    return () => { active = false; subscription.subscription.unsubscribe() }
+    retry()
+    window.addEventListener('online', retry)
+    window.addEventListener('focus', retry)
+    const timer = window.setInterval(retry, 60_000)
+    return () => {
+      active = false
+      completeLogin.current = null
+      window.clearTimeout(eventTimer)
+      window.clearInterval(timer)
+      window.removeEventListener('online', retry)
+      window.removeEventListener('focus', retry)
+      subscription.subscription.unsubscribe()
+    }
   }, [])
 
   const login = async (email: string, password: string) => {
@@ -278,7 +339,7 @@ export function App() {
     if (error || !data.user) throw new Error(error?.message ?? '登录失败')
     resumeAccountSync(data.user.id)
     rememberAccount(data.user)
-    setAccount({ id: data.user.id, email: data.user.email ?? '' })
+    completeLogin.current?.(data.user)
   }
 
   const logout = async () => {
@@ -293,6 +354,6 @@ export function App() {
     setAccount(null)
   }
 
-  return <><Toaster position="top-right" />{!sessionEnded && <PwaUpdatePrompt />}{loading ? <div className="app-loading"><div className="loading-spinner" /><p>加载中…</p></div> : account ? <NotesWorkspace key={account.id} account={account} onLogout={logout} sessionEnded={sessionEnded} onDiscardDraft={discardDraftAndLock} /> : <Login onLogin={login} onDemo={() => setAccount(demoAccount)} />}</>
+  // These toasts contain status text only; they must not intercept toolbar clicks.
+  return <><Toaster position="top-right" style={{ pointerEvents: 'none' }} toastOptions={{ style: { pointerEvents: 'none' } }} />{!sessionEnded && <PwaUpdatePrompt />}{loading ? <div className="app-loading"><div className="loading-spinner" /><p>加载中…</p></div> : account ? <NotesWorkspace key={account.id} account={account} onLogout={logout} sessionEnded={sessionEnded} onDiscardDraft={discardDraftAndLock} /> : <Login onLogin={login} onDemo={() => setAccount(demoAccount)} />}</>
 }
-

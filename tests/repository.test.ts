@@ -101,6 +101,53 @@ describe('local data', () => {
     expect(await db.notes.where('ownerId').equals('account-a').count()).toBe(1)
   })
 
+  it.each(['account-a', 'account-b'])('preserves different remote snapshots of the same conflict when importing into %s', async targetAccount => {
+    const local = await createNoteWithContent('account-a', null, '本机便签', emptyDocument, '')
+    const document = (text: string) => ({ type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text }] }] })
+    const oldRemote = { ...local, title: '云端便签', doc: document('第一版正文'), plainText: '第一版正文', serverVersion: 1 }
+    const conflictId = crypto.randomUUID()
+    await db.conflicts.put({ id: conflictId, ownerId: 'account-a', entity: 'note', entityId: local.id,
+      local, remote: oldRemote, createdAt: new Date().toISOString() })
+    const oldArchive = parseBackup(JSON.stringify(await makeBackup('account-a')))
+    const newRemote = { ...oldRemote, doc: document('第二版正文'), plainText: '第二版正文', serverVersion: 2 }
+    await db.conflicts.update(conflictId, { remote: newRemote })
+    const newArchive = parseBackup(JSON.stringify(await makeBackup('account-a')))
+
+    await importBackup(targetAccount, oldArchive)
+    expect(await importBackup(targetAccount, newArchive)).toEqual({ notes: 1, folders: 0, copies: 1 })
+    const copies = (await db.notes.where('ownerId').equals(targetAccount).toArray())
+      .filter(note => note.title === '云端便签（冲突副本）')
+    expect(copies).toHaveLength(2)
+    expect(copies.map(note => note.doc)).toEqual(expect.arrayContaining([oldRemote.doc, newRemote.doc]))
+    const queued = await db.outbox.where('ownerId').equals(targetAccount).toArray()
+    for (const copy of copies) {
+      expect(queued.find(item => item.entityId === copy.id)?.payload).toMatchObject({ doc: copy.doc, plainText: copy.plainText })
+    }
+    expect(await importBackup(targetAccount, oldArchive)).toEqual({ notes: 0, folders: 0, copies: 0 })
+    expect(await importBackup(targetAccount, newArchive)).toEqual({ notes: 0, folders: 0, copies: 0 })
+    expect(await db.notes.get(local.id)).toEqual(local)
+  })
+
+  it('deduplicates an unchanged conflict copy imported by the earlier ID-only rule', async () => {
+    const local = await createNote('account-a', null)
+    const remote = { ...local, title: '云端旧版', serverVersion: 1 }
+    const conflictId = crypto.randomUUID()
+    await db.conflicts.put({ id: conflictId, ownerId: 'account-a', entity: 'note', entityId: local.id,
+      local, remote, createdAt: new Date().toISOString() })
+    const archive = await makeBackup('account-a')
+    const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`account-a\0account-a\0conflict\0${conflictId}`)))
+    hash[6] = (hash[6] & 0x0f) | 0x40
+    hash[8] = (hash[8] & 0x3f) | 0x80
+    const hex = [...hash.slice(0, 16)].map(byte => byte.toString(16).padStart(2, '0')).join('')
+    const legacyId = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+    const legacyCopy = { ...remote, id: legacyId, title: '云端旧版（冲突副本）', localRev: 1, serverVersion: 0, confirmedRev: 0 }
+    await db.notes.add(legacyCopy)
+    expect(await importBackup('account-a', archive)).toEqual({ notes: 0, folders: 0, copies: 0 })
+    archive.conflicts[0].remote = { ...remote, title: '云端新版', serverVersion: 2 }
+    expect(await importBackup('account-a', archive)).toEqual({ notes: 1, folders: 0, copies: 1 })
+    expect(await db.notes.get(legacyId)).toEqual(legacyCopy)
+  })
+
   it('deletes a folder without deleting its notes', async () => {
     const folder = await createFolder('account-a', '临时分类')
     const note = await createNote('account-a', folder.id)
@@ -173,4 +220,3 @@ describe('local data', () => {
     expect(await importBackup('local-demo', archive)).toEqual({ notes: 0, folders: 0, copies: 0 })
   })
 })
-

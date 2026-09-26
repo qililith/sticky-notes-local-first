@@ -5,7 +5,7 @@ const key = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY
 export const demoMode = import.meta.env.DEV && import.meta.env.VITE_DEMO_MODE === 'true'
 export const supabase: SupabaseClient | null = url && key ? createClient(url, key) : null
 
-const accountKey = 'sticky-notes-last-account'
+export const accountKey = 'sticky-notes-last-account'
 
 export function rememberAccount(user: User) {
   localStorage.setItem(accountKey, JSON.stringify({ id: user.id, email: user.email ?? '' }))
@@ -26,4 +26,3 @@ export function getRememberedAccount(): { id: string; email: string } | null {
 export function forgetAccount() {
   localStorage.removeItem(accountKey)
 }
-

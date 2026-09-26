@@ -62,7 +62,7 @@ export function DataPanel({ ownerId, note, hasUnsavedDraft, onClose, onCleared }
         {meta?.lastSyncedAt && <p>上次同步：{new Date(meta.lastSyncedAt).toLocaleString('zh-CN')}</p>}
         {meta?.lastError && <p className="panel-error">同步错误：{meta.lastError}</p>}
         {storage && <p>{storage}</p>}
-        <button type="button" disabled={busy || !online || !supabase} onClick={() => void run(async () => { if (!await syncOnce(ownerId)) throw new Error('同步未成功，请查看上方错误') }, '同步已完成')}>立即重试同步</button>
+        <button type="button" disabled={busy || !online || !supabase} onClick={() => void run(async () => { if (!await syncOnce(ownerId)) throw new Error('同步未成功，请查看上方错误') }, '本轮同步检查已完成')}>立即重试同步</button>
       </section>
       <section><h3>冲突</h3>
         {conflicts.length === 0 ? <p>没有待处理冲突。</p> : conflicts.map(item => <div className="panel-card" key={item.id}>
@@ -108,4 +108,3 @@ export function DataPanel({ ownerId, note, hasUnsavedDraft, onClose, onCleared }
     </section>
   </div>
 }
-

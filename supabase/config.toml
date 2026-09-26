@@ -1,0 +1,17 @@
+# Local CLI workspace identity. Hosted projects are selected with `supabase link`.
+project_id = "sticky-notes-local-first"
+
+# Shared security defaults. `db push` does not apply hosted Auth/API settings;
+# review `config diff` before using `config push`. Undeclared settings stay unchanged.
+[api]
+schemas = ["public", "graphql_public"]
+extra_search_path = ["public", "extensions"]
+
+[auth]
+enable_signup = false
+enable_anonymous_sign_ins = false
+
+[auth.email]
+# Keep email/password login available for admin-created accounts.
+# Public registration is disabled by auth.enable_signup above.
+enable_signup = true
