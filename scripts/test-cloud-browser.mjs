@@ -6,6 +6,7 @@ import { build, preview } from 'vite'
 export async function runCloudBrowserChecks({ accounts, readClient, runId, projectUrl, setTestAccountBBan, revokeTestSession }) {
   let server
   let browser
+  let restoreBuild = false
   let step = 'Build production PWA and start isolated preview'
   const pages = []
   const title = `网页联调-${runId.slice(0, 8)}`
@@ -346,6 +347,110 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
     await sync(b, accounts[1].id)
     await wait.poll(async () => (await rows(b, 'outbox', accounts[1].id)).length).toBe(0)
     pass('Banned account is locked and cannot sign in; after unbanning, its untouched local queue synchronizes')
+
+    step = 'Prepare two same-origin tabs with an unsynced note and a failed editor draft'
+    await contexts[0].route(dataApi, route => route.abort())
+    await closePanel(a1)
+    // This tab was intentionally locked by the earlier device-clear test.
+    if (await sibling.getByRole('heading', { name: '欢迎使用' }).isVisible()) await login(sibling, accounts[0])
+    await wait(sibling.getByRole('button', { name: '退出登录' })).toBeVisible()
+    await sibling.evaluate(() => navigator.serviceWorker.ready)
+    await sibling.reload()
+    await sibling.waitForFunction(() => Boolean(navigator.serviceWorker.controller))
+    const upgradeTitle = `升级待上传-${runId.slice(0, 8)}`
+    const upgradeText = '应用更新后，这条尚未上传的正文仍需完整保留。'
+    await a1.getByTitle('新建便签', { exact: true }).click()
+    await a1.getByLabel('便签标题', { exact: true }).fill(upgradeTitle)
+    await a1.getByLabel('便签正文', { exact: true }).fill(upgradeText)
+    await wait.poll(async () => (await rows(a1, 'notes')).find(row => row.title === upgradeTitle)?.plainText).toBe(upgradeText)
+    const upgradeId = (await rows(a1, 'notes')).find(row => row.title === upgradeTitle).id
+    await sibling.getByTitle('新建便签', { exact: true }).click()
+    await sibling.getByLabel('便签标题', { exact: true }).fill(`升级失败草稿-${runId.slice(0, 8)}`)
+    await sibling.getByLabel('便签正文', { exact: true }).fill('尚未发生错误时的原文。')
+    await wait(sibling.locator('.save-status')).toContainText('本地已保存')
+    // Fail one actual IndexedDB write in this disposable browser, not a mocked React guard.
+    await sibling.evaluate(() => {
+      const original = IDBObjectStore.prototype.put
+      IDBObjectStore.prototype.put = function (...args) {
+        if (this.name === 'notes') {
+          IDBObjectStore.prototype.put = original
+          throw new DOMException('Test storage failure', 'QuotaExceededError')
+        }
+        return original.apply(this, args)
+      }
+    })
+    const failedDraft = '另一窗口更新时，不能丢失这段尚未保存的草稿。'
+    await sibling.getByLabel('便签正文', { exact: true }).fill(failedDraft)
+    await wait(sibling.locator('.save-status')).toHaveText('本地未保存')
+    const beforeOtherAccount = await rows(a1, 'notes', accounts[1].id)
+    check(beforeOtherAccount.length > 0, 'Upgrade check needs another account cache')
+    const beforeHistory = await rows(a1, 'history')
+    check(beforeHistory.length > 0, 'Upgrade check needs confirmed history')
+    const beforeQueue = (await rows(a1, 'outbox')).filter(row => row.entityId === upgradeId)
+    check(beforeQueue.length > 0, 'Upgrade check needs a pending note')
+    const oldScript = await a1.locator('script[type="module"]').first().getAttribute('src')
+
+    step = 'Install a new PWA build without changing real authentication or database schema'
+    // Change only a test-only bundle marker. Auth and application code stay identical;
+    // this checks real SW replacement, not compatibility with a future schema migration.
+    restoreBuild = true
+    await build({ plugins: [{ name: 'cloud-upgrade-test-marker', enforce: 'pre',
+      transform(code, id) {
+        if (id.replaceAll('\\', '/').endsWith('/src/main.tsx')) {
+          return { code: `document.documentElement.dataset.testBuild = ${JSON.stringify(runId)};\n${code}`, map: null }
+        }
+      }
+    }] })
+    await a1.evaluate(async () => {
+      const registration = await navigator.serviceWorker.getRegistration()
+      if (!registration) throw new Error('Missing test service worker')
+      await registration.update()
+    })
+    const update = page => page.getByRole('button', { name: '更新并刷新', exact: true })
+    await wait(update(a1)).toBeVisible()
+    await wait(update(sibling)).toBeVisible()
+    await update(sibling).click()
+    await wait(sibling.getByText('便签有未保存草稿，请先另存或复制草稿文本', { exact: true })).toBeVisible()
+
+    step = 'Update one tab while the other retains its failed draft without a reload dialog'
+    let forcedDraftReloads = 0
+    sibling.removeAllListeners('dialog')
+    sibling.on('dialog', dialog => { if (dialog.type() === 'beforeunload') forcedDraftReloads++; void dialog.accept() })
+    step = 'Wait for the initiating tab to load the updated PWA'
+    await Promise.all([a1.waitForEvent('load'), update(a1).click()])
+    await wait.poll(() => a1.evaluate(() => document.documentElement.dataset.testBuild)).toBe(runId)
+    check(await a1.locator('script[type="module"]').first().getAttribute('src') !== oldScript, 'PWA kept its old entry bundle')
+    step = 'Verify the other tab did not refresh away its failed draft'
+    await wait(sibling.getByLabel('便签正文', { exact: true })).toHaveText(failedDraft)
+    await wait(sibling.locator('.save-status')).toHaveText('本地未保存')
+    check(forcedDraftReloads === 0, 'Other-tab activation tried to reload an unsaved draft')
+    await sibling.getByRole('button', { name: '另存为新便签', exact: true }).click()
+    await wait(sibling.locator('.save-status')).toContainText('本地已保存')
+    step = 'Explicitly refresh the previously deferred tab after saving its draft copy'
+    await Promise.all([sibling.waitForEvent('load'), update(sibling).click()])
+    await wait.poll(() => sibling.evaluate(() => document.documentElement.dataset.testBuild)).toBe(runId)
+    pass('Cross-tab PWA activation preserves a failed draft; explicit recovery then permits updating')
+
+    step = 'Check offline storage and real synchronization after the PWA upgrade'
+    await contexts[0].setOffline(true)
+    await Promise.all([a1.reload(), sibling.reload()])
+    await wait(a1.getByRole('button', { name: '退出登录' })).toBeVisible()
+    await wait(sibling.getByRole('button', { name: '退出登录' })).toBeVisible()
+    check((await note(a1, upgradeId))?.plainText === upgradeText, 'PWA upgrade lost the unsynced note')
+    check((await rows(a1, 'notes')).some(row => row.plainText === failedDraft), 'PWA upgrade lost the recovered draft')
+    const afterQueue = await rows(a1, 'outbox')
+    check(beforeQueue.every(row => afterQueue.some(next => next.id === row.id && JSON.stringify(next.payload) === JSON.stringify(row.payload))), 'PWA upgrade changed a pending mutation')
+    check(JSON.stringify(await rows(a1, 'notes', accounts[1].id)) === JSON.stringify(beforeOtherAccount), 'PWA upgrade altered another account cache')
+    const afterHistory = await rows(a1, 'history')
+    check(beforeHistory.every(row => afterHistory.some(next => next.id === row.id && JSON.stringify(next.snapshot) === JSON.stringify(row.snapshot))), 'PWA upgrade lost confirmed history')
+    await contexts[0].unroute(dataApi)
+    await contexts[0].setOffline(false)
+    await sync(a1)
+    await sync(a2)
+    await wait(item(a2, upgradeTitle)).toBeVisible()
+    const upgradedCloud = await readClient.from('notes').select('plain_text').eq('id', upgradeId).single()
+    check(!upgradedCloud.error && upgradedCloud.data.plain_text === upgradeText, 'Upgraded queue did not reach the real cloud')
+    pass('Real-account PWA upgrade retains offline notes, queue, history and account caches, then synchronizes')
   } catch (error) {
     console.error(`FAIL UI ${step} (${error instanceof Error ? error.name : 'unknown'}). No credentials or request details logged.`)
     if (error instanceof Error) {
@@ -355,14 +460,22 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
     }
     for (let index = 0; index < pages.length; index++) {
       const page = pages[index]
-      if (!page.isClosed()) console.error(`UI ${index}: workspace=${await page.locator('.app-layout').isVisible().catch(() => false)} login=${await page.getByRole('heading', { name: '欢迎使用' }).isVisible().catch(() => false)}`)
+      if (!page.isClosed()) {
+        const state = await page.evaluate(() => ({ ready: document.readyState, upgraded: Boolean(document.documentElement.dataset.testBuild),
+          save: document.querySelector('.save-status')?.textContent ?? null })).catch(() => null)
+        console.error(`UI ${index}: workspace=${await page.locator('.app-layout').isVisible().catch(() => false)} login=${await page.getByRole('heading', { name: '欢迎使用' }).isVisible().catch(() => false)} state=${JSON.stringify(state)}`)
+      }
       if (!page.isClosed() && await page.locator('.app-layout').isVisible().catch(() => false)) {
         await page.screenshot({ path: `test-results/cloud-ui-failure-${index}.png`, fullPage: true }).catch(() => {})
       }
     }
     throw new Error('Cloud browser checks failed; see the named UI step')
   } finally {
-    await browser?.close()
-    if (server) await new Promise(resolve => server.httpServer.close(resolve))
+    try {
+      await browser?.close()
+      if (server) await new Promise(resolve => server.httpServer.close(resolve))
+    } finally {
+      if (restoreBuild) await build()
+    }
   }
 }
