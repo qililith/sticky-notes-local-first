@@ -1,6 +1,7 @@
 import { db } from './db'
 import { isAccountSyncPaused } from './accountSyncGate'
-import { checkedFolderName, checkedTitle, titleWithSuffix } from './limits'
+import { titleWithSuffix } from './limits'
+import { validateBackup } from './backupValidation'
 import { hasPendingEditorWrites, hasUnresolvedEditorDraft } from './saveGuard'
 import { folderPayload, notePayload, type Conflict, type Folder, type Mutation, type Note, type Revision } from './types'
 
@@ -48,37 +49,7 @@ export function parseBackup(text: string): BackupArchive {
   if (text.length > 100_000_000) throw new Error('备份文件过大，请分批处理')
   let value: unknown
   try { value = JSON.parse(text) } catch { throw new Error('文件不是有效的 JSON') }
-  if (!value || typeof value !== 'object') throw new Error('备份文件格式不正确')
-  const archive = value as Partial<BackupArchive>
-  if (archive.schema !== 1 || typeof archive.sourceAccount !== 'string'
-    || !Array.isArray(archive.notes) || !Array.isArray(archive.folders)
-    || !Array.isArray(archive.pending) || !Array.isArray(archive.conflicts) || !Array.isArray(archive.history)) {
-    throw new Error('备份文件版本或内容不符合要求')
-  }
-  for (const note of archive.notes) {
-    if (!note || typeof note.id !== 'string' || typeof note.title !== 'string'
-      || typeof note.plainText !== 'string' || !note.doc || note.doc.type !== 'doc'
-      || typeof note.createdAt !== 'string' || typeof note.updatedAt !== 'string'
-      || typeof note.ownerId !== 'string' || note.ownerId !== archive.sourceAccount) {
-      throw new Error('备份文件中有无效便签')
-    }
-    if (note.docVersion !== undefined && note.docVersion !== 1) throw new Error('备份文件中的正文版本不受支持')
-    checkedTitle(note.title)
-    note.docVersion = 1
-  }
-  for (const folder of archive.folders) {
-    if (!folder || typeof folder.id !== 'string' || typeof folder.name !== 'string'
-      || typeof folder.ownerId !== 'string' || folder.ownerId !== archive.sourceAccount) {
-      throw new Error('备份文件中有无效文件夹')
-    }
-    checkedFolderName(folder.name)
-  }
-  for (const conflict of archive.conflicts) {
-    if (conflict?.entity === 'note' && conflict.remote && 'title' in conflict.remote && typeof conflict.remote.title === 'string') {
-      checkedTitle(conflict.remote.title)
-    }
-  }
-  return archive as BackupArchive
+  return validateBackup(value)
 }
 
 async function stableImportId(ownerId: string, sourceAccount: string, kind: string, sourceId: string): Promise<string> {
@@ -91,28 +62,31 @@ async function stableImportId(ownerId: string, sourceAccount: string, kind: stri
 }
 
 export async function importBackup(ownerId: string, archive: BackupArchive): Promise<{ notes: number; folders: number; copies: number }> {
+  archive = validateBackup(archive)
   const sameAccount = archive.sourceAccount === ownerId
   const folderMap = new Map<string, string>()
+  const legacyFolderMap = new Map<string, string>()
   const noteMap = new Map<string, string>()
   let addedNotes = 0
   let addedFolders = 0
   let copies = 0
   // All hashing happens before the IndexedDB transaction; WebCrypto would otherwise close it.
-  for (const source of archive.folders) folderMap.set(source.id, await stableImportId(ownerId, archive.sourceAccount, 'folder', source.id))
+  for (const source of archive.folders) {
+    folderMap.set(source.id, await stableImportId(ownerId, archive.sourceAccount, 'folder', `${source.id}\0${JSON.stringify(folderPayload(source))}`))
+    legacyFolderMap.set(source.id, await stableImportId(ownerId, archive.sourceAccount, 'folder', source.id))
+  }
   for (const source of archive.notes) {
     const fingerprint = JSON.stringify(notePayload(source))
     noteMap.set(source.id, await stableImportId(ownerId, archive.sourceAccount, 'note', `${source.id}\0${fingerprint}`))
   }
   const conflictMap = new Map<string, { id: string; legacyId: string }>()
   for (const source of archive.conflicts) {
-    if (source.entity !== 'note') continue
-    const remote = source.remote as Note
-    if (!remote?.doc || typeof remote.title !== 'string') continue
     // A conflict ID stays the same while newer remote versions are pulled.
     // Deduplicate each snapshot, not every version of that conflict together.
-    const fingerprint = JSON.stringify(notePayload(remote))
+    const fingerprint = JSON.stringify(source.entity === 'note' ? notePayload(source.remote as Note) : folderPayload(source.remote as Folder))
+    const kind = source.entity === 'note' ? 'conflict' : 'folder-conflict'
     conflictMap.set(source.id, {
-      id: await stableImportId(ownerId, archive.sourceAccount, 'conflict', `${source.id}\0${fingerprint}`),
+      id: await stableImportId(ownerId, archive.sourceAccount, kind, `${source.id}\0${fingerprint}`),
       legacyId: await stableImportId(ownerId, archive.sourceAccount, 'conflict', source.id)
     })
   }
@@ -120,8 +94,16 @@ export async function importBackup(ownerId: string, archive: BackupArchive): Pro
     if (isAccountSyncPaused(ownerId)) throw new Error('本机账号数据已清除，请重新登录')
     for (const source of archive.folders) {
       const existing = await db.folders.get(source.id)
-      if (sameAccount && existing?.ownerId === ownerId) {
+      if (sameAccount && existing?.ownerId === ownerId
+        && JSON.stringify(folderPayload(existing)) === JSON.stringify(folderPayload(source))) {
         folderMap.set(source.id, source.id)
+        continue
+      }
+      // Earlier imports used only the source ID. Reuse an unchanged copy, but
+      // preserve later folder names/order/deletion states as separate snapshots.
+      const legacy = await db.folders.get(legacyFolderMap.get(source.id)!)
+      if (legacy?.ownerId === ownerId && JSON.stringify(folderPayload(legacy)) === JSON.stringify(folderPayload(source))) {
+        folderMap.set(source.id, legacy.id)
         continue
       }
       const newId = sameAccount && !existing ? source.id : folderMap.get(source.id)!
@@ -131,6 +113,7 @@ export async function importBackup(ownerId: string, archive: BackupArchive): Pro
       await db.folders.add(folder)
       await db.outbox.add({ id: crypto.randomUUID(), ownerId, entity: 'folder', entityId: newId, baseVersion: 0, localRev: 1, payload: folderPayload(folder), createdAt: new Date().toISOString(), state: 'pending' })
       addedFolders++
+      if (sameAccount && existing) copies++
     }
     for (const source of archive.notes) {
       const existing = await db.notes.get(source.id)
@@ -154,10 +137,17 @@ export async function importBackup(ownerId: string, archive: BackupArchive): Pro
     }
     // A conflict's remote version may not be in the current-note list. Keep it as a visible copy.
     for (const source of archive.conflicts) {
-      if (source.entity !== 'note') continue
-      const remote = source.remote as Note
-      if (!remote?.doc || typeof remote.title !== 'string') continue
       const { id: newId, legacyId } = conflictMap.get(source.id)!
+      if (source.entity === 'folder') {
+        if (await db.folders.get(newId)) continue
+        const remote = source.remote as Folder
+        const folder: Folder = { ...remote, id: newId, ownerId, name: titleWithSuffix(remote.name, '（冲突副本）'), deletedAt: null, localRev: 1, serverVersion: 0, confirmedRev: 0 }
+        await db.folders.add(folder)
+        await db.outbox.add({ id: crypto.randomUUID(), ownerId, entity: 'folder', entityId: newId, baseVersion: 0, localRev: 1, payload: folderPayload(folder), createdAt: new Date().toISOString(), state: 'pending' })
+        addedFolders++; copies++
+        continue
+      }
+      const remote = source.remote as Note
       if (await db.notes.get(newId)) continue
       const note: Note = { ...remote, id: newId, ownerId, title: titleWithSuffix(remote.title, '（冲突副本）'), folderId: null, deletedAt: null, localRev: 1, serverVersion: 0, confirmedRev: 0 }
       const legacy = await db.notes.get(legacyId)
@@ -167,9 +157,7 @@ export async function importBackup(ownerId: string, archive: BackupArchive): Pro
       addedNotes++; copies++
     }
     for (const source of archive.history) {
-      if (!source || typeof source.id !== 'string' || typeof source.noteId !== 'string' || !source.snapshot?.doc) continue
-      const targetId = noteMap.get(source.noteId)
-      if (!targetId) continue
+      const targetId = noteMap.get(source.noteId)!
       const id = `import:${ownerId}:${targetId}:${source.id}`
       if (await db.history.get(id)) continue
       await db.history.add({ ...source, id, ownerId, noteId: targetId, snapshot: { ...source.snapshot, id: targetId, ownerId, folderId: source.snapshot.folderId ? folderMap.get(source.snapshot.folderId) ?? null : null } })

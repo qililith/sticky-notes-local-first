@@ -85,6 +85,7 @@ describe('local data', () => {
     await importBackup('account-a', oldArchive)
     const laterArchive = await makeBackup('account-a')
     laterArchive.notes = laterArchive.notes.filter(item => item.id === note.id)
+    laterArchive.pending = laterArchive.pending.filter(item => item.entityId === note.id)
     await updateNote('account-a', note.id, { title: '当前内容' })
     const result = await importBackup('account-a', laterArchive)
     expect(result.notes).toBe(1)

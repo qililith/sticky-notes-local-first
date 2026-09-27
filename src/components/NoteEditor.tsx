@@ -1,10 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { EditorContent, useEditor } from '@tiptap/react'
 import { toast } from 'sonner'
-import StarterKit from '@tiptap/starter-kit'
-import Highlight from '@tiptap/extension-highlight'
-import TaskList from '@tiptap/extension-task-list'
-import TaskItem from '@tiptap/extension-task-item'
+import { createEditorExtensions } from '../data/editorSchema'
 import { Bold, CheckSquare, Heading1, Heading2, Heading3, Highlighter, Italic, List, ListOrdered, Maximize2, Minimize2, Plus, Redo2, Undo2 } from 'lucide-react'
 import type { Note, RichText } from '../data/types'
 import { MAX_TITLE_LENGTH, titleWithSuffix } from '../data/limits'
@@ -52,12 +49,7 @@ function EditorBody({ note, onEdit, onSaveCopy, onDiscardError, onCreate, onOpen
   }, [note.id, onEdit])
 
   const editor = useEditor({
-    extensions: [
-      StarterKit.configure({ heading: { levels: [1, 2, 3] } }),
-      Highlight,
-      TaskList,
-      TaskItem.configure({ nested: true })
-    ],
+    extensions: createEditorExtensions(),
     content: note.doc,
     onUpdate: ({ editor: changed }) => {
       const plainText = changed.getText({ blockSeparator: '\n' })
@@ -177,4 +169,3 @@ export function NoteEditor(props: Props) {
   if (!props.note) return <div className="editor-empty"><div className="editor-empty-content"><p>选择或创建一个便签开始编辑</p></div></div>
   return <EditorBody key={props.note.id} {...props} note={props.note} />
 }
-

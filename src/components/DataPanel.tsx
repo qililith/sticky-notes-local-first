@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useLiveQuery } from 'dexie-react-hooks'
 import { toast } from 'sonner'
 import { supabase } from '../auth'
@@ -13,6 +13,7 @@ type Props = { ownerId: string; note: Note | null; hasUnsavedDraft: boolean; onC
 
 export function DataPanel({ ownerId, note, hasUnsavedDraft, onClose, onCleared }: Props) {
   const [preview, setPreview] = useState<BackupArchive | null>(null)
+  const fileReadId = useRef(0)
   const [busy, setBusy] = useState(false)
   const [online, setOnline] = useState(navigator.onLine)
   const [storage, setStorage] = useState<string | null>(null)
@@ -46,12 +47,15 @@ export function DataPanel({ ownerId, note, hasUnsavedDraft, onClose, onCleared }
   }
 
   const readFile = async (file?: File) => {
+    const readId = ++fileReadId.current
+    setPreview(null)
     if (!file) return
     try {
       if (file.size > 100_000_000) throw new Error('备份文件过大，请分批处理')
-      setPreview(parseBackup(await file.text()))
+      const text = await file.text()
+      if (readId === fileReadId.current) setPreview(parseBackup(text))
     }
-    catch (cause) { toast.error(cause instanceof Error ? cause.message : '无法读取备份') }
+    catch (cause) { if (readId === fileReadId.current) toast.error(cause instanceof Error ? cause.message : '无法读取备份') }
   }
 
   return <div className="data-panel-overlay" onClick={onClose}>
