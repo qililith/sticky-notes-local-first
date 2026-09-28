@@ -12,7 +12,7 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
   const title = `网页联调-${runId.slice(0, 8)}`
   const textOne = '第一设备离线编辑，恢复联网后上传。'
   const textTwo = '第二设备独立修改，必须保留冲突双方。'
-  const initialText = '真实网页登录后的第一段正文。'
+  const initialText = '真实网页登录后的第一段正文。\n\n<div>按原样保存</div> &amp;  **星号**'
   const check = (value, label) => { if (!value) throw new Error(label) }
   const pass = label => console.log(`PASS UI ${label}`)
   const wait = expect.configure({ timeout: 30_000 })
@@ -108,17 +108,26 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
     step = 'Create through UI and exchange the note between browsers'
     await a1.getByTitle('新建便签', { exact: true }).click()
     await a1.getByLabel('便签标题', { exact: true }).fill(title)
-    await a1.getByLabel('便签正文', { exact: true }).fill(initialText)
+    await a1.getByLabel('便签正文', { exact: true }).click()
+    await a1.getByLabel('便签正文', { exact: true }).evaluate((element, text) => {
+      const clipboardData = new DataTransfer()
+      clipboardData.setData('text/plain', text)
+      clipboardData.setData('text/html', '<p>来自网页的排版</p>')
+      element.dispatchEvent(new ClipboardEvent('paste', { clipboardData, bubbles: true, cancelable: true }))
+    }, initialText)
     await wait.poll(async () => (await rows(a1, 'notes')).find(row => row.title === title)?.plainText).toBe(initialText)
     const noteId = (await rows(a1, 'notes')).find(row => row.title === title).id
     await sync(a1)
     await sync(a2)
     await item(a2).click()
-    await wait(a2.getByLabel('便签正文', { exact: true })).toHaveText(initialText)
+    await wait(a2.getByLabel('便签正文', { exact: true })).toContainText('真实网页登录后的第一段正文。')
+    await wait(a2.getByLabel('便签正文', { exact: true })).toContainText('<div>按原样保存</div> &amp;  **星号**')
+    check((await note(a2, noteId))?.plainText === initialText, 'Pasted whitespace changed in the second browser')
+    check(JSON.stringify((await note(a2, noteId))?.doc) === JSON.stringify((await note(a1, noteId))?.doc), 'Pasted document changed during synchronization')
     await sync(b, accounts[1].id)
     await wait(item(b)).toHaveCount(0)
     check((await rows(b, 'notes', accounts[0].id)).length === 0, 'Other account leaked into browser storage')
-    pass('UI edits reach the second browser; another account cannot see them')
+    pass('UI pasted text reaches the second browser unchanged; another account cannot see it')
 
     step = 'Reload and edit while online but Auth returns 503'
     const authApi = `${projectUrl}/auth/v1/**`
@@ -131,7 +140,8 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
     await contexts[0].route(blockedDataApi, route => route.abort())
     await a1.reload()
     check(await a1.evaluate(() => navigator.onLine), 'Outage check must leave browser online')
-    await wait(a1.getByLabel('便签正文', { exact: true })).toHaveText(initialText)
+    await wait(a1.getByLabel('便签正文', { exact: true })).toContainText('真实网页登录后的第一段正文。')
+    await wait(a1.getByLabel('便签正文', { exact: true })).toContainText('<div>按原样保存</div> &amp;  **星号**')
     await wait.poll(() => authFailures).toBeGreaterThan(0)
     await a1.getByLabel('便签正文', { exact: true }).fill('认证服务临时不可达，本机仍能保存。')
     await wait.poll(async () => (await note(a1, noteId))?.plainText).toBe('认证服务临时不可达，本机仍能保存。')

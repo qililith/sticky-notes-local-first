@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { EditorContent, useEditor } from '@tiptap/react'
+import { closeHistory } from '@tiptap/pm/history'
+import { Fragment, Slice } from '@tiptap/pm/model'
 import { toast } from 'sonner'
 import { createEditorExtensions } from '../data/editorSchema'
 import { Bold, CheckSquare, Heading1, Heading2, Heading3, Highlighter, Italic, List, ListOrdered, Maximize2, Minimize2, Plus, Redo2, Undo2 } from 'lucide-react'
@@ -50,6 +52,7 @@ function EditorBody({ note, onEdit, onSaveCopy, onDiscardError, onCreate, onOpen
 
   const editor = useEditor({
     extensions: createEditorExtensions(),
+    enablePasteRules: false,
     content: note.doc,
     onUpdate: ({ editor: changed }) => {
       const plainText = changed.getText({ blockSeparator: '\n' })
@@ -59,12 +62,25 @@ function EditorBody({ note, onEdit, onSaveCopy, onDiscardError, onCreate, onOpen
     editorProps: {
       attributes: { class: 'editor-content', 'aria-label': '便签正文' },
       transformPastedHTML: () => '',
-      handlePaste: (_view, event) => {
-        const html = event.clipboardData?.getData('text/html')
-        if (!html) return false
-        const plain = event.clipboardData?.getData('text/plain') ?? ''
+      handlePaste: (view, event) => {
+        if (!event.clipboardData) return false
+        const plain = event.clipboardData.getData('text/plain').replace(/\r\n?/g, '\n')
         event.preventDefault()
-        editor?.commands.insertContent(plain)
+        if (!plain) { toast.error('剪贴板没有可粘贴的纯文本'); return true }
+        const { state } = view
+        if (state.selection.$from.parent.type.spec.code) {
+          view.dispatch(closeHistory(state.tr).insertText(plain).scrollIntoView())
+          view.dispatch(closeHistory(view.state.tr))
+          return true
+        }
+        // Use the current view, not the editor reference captured during its
+        // initialization. Text nodes preserve literal HTML and empty lines.
+        const marks = state.storedMarks ?? state.selection.$from.marks()
+        const paragraphs = plain.split('\n').map(line => state.schema.nodes.paragraph.create(null,
+          line ? state.schema.text(line, marks) : undefined))
+        const slice = Slice.maxOpen(Fragment.fromArray(paragraphs))
+        view.dispatch(closeHistory(state.tr).replaceSelection(slice).setMeta('uiEvent', 'paste').scrollIntoView())
+        view.dispatch(closeHistory(view.state.tr))
         return true
       }
     }
