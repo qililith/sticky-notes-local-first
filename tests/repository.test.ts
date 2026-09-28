@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { db } from '../src/data/db'
 import { downloadBackup, makeBackup, importBackup, parseBackup } from '../src/data/backup'
-import { clearAccountFromDevice, createFolder, createNote, createNoteWithContent, deleteFolder, setNoteContent, updateFolder, updateNote } from '../src/data/repository'
+import { clearAccountFromDevice, createFolder, createNote, createNoteWithContent, deleteFolder, reorderFolders, setNoteContent, updateFolder, updateNote } from '../src/data/repository'
 import { isAccountSyncPaused, resumeAccountSync } from '../src/data/accountSyncGate'
 import { beginEditorWrite, setUnresolvedEditorDraft } from '../src/data/saveGuard'
 import { titleWithSuffix } from '../src/data/limits'
@@ -156,6 +156,31 @@ describe('local data', () => {
     expect((await db.folders.get(folder.id))?.deletedAt).not.toBeNull()
     expect((await db.notes.get(note.id))?.folderId).toBeNull()
     expect((await db.notes.get(note.id))?.deletedAt).toBeNull()
+  })
+
+  it('reorders every folder and its upload queue atomically', async () => {
+    const first = await createFolder('account-a', '第一')
+    const second = await createFolder('account-a', '第二')
+    const third = await createFolder('account-a', '第三')
+    const originalQueue = await db.outbox.toArray()
+    const broken = vi.spyOn(db.outbox, 'put').mockRejectedValueOnce(new DOMException('Storage full', 'QuotaExceededError'))
+    try {
+      await expect(reorderFolders('account-a', [third.id, second.id, first.id], [first.id, second.id, third.id])).rejects.toThrow('Storage full')
+    } finally { broken.mockRestore() }
+    expect((await db.folders.where('ownerId').equals('account-a').sortBy('sortOrder')).map(folder => folder.id))
+      .toEqual([first.id, second.id, third.id])
+    expect(await db.outbox.toArray()).toEqual(originalQueue)
+    await expect(reorderFolders('account-b', [third.id, second.id, first.id], [first.id, second.id, third.id])).rejects.toThrow('已变化')
+    await reorderFolders('account-a', [third.id, second.id, first.id], [first.id, second.id, third.id])
+    expect((await db.folders.where('ownerId').equals('account-a').sortBy('sortOrder')).map(folder => folder.id))
+      .toEqual([third.id, second.id, first.id])
+    const queued = await db.outbox.toArray()
+    expect(queued.find(item => item.entityId === third.id)?.payload).toMatchObject({ sortOrder: 0 })
+    expect(queued.find(item => item.entityId === first.id)?.payload).toMatchObject({ sortOrder: 2 })
+    await expect(reorderFolders('account-a', [first.id, second.id, third.id], [first.id, second.id, third.id]))
+      .rejects.toThrow('其他窗口变化')
+    expect((await db.folders.where('ownerId').equals('account-a').sortBy('sortOrder')).map(folder => folder.id))
+      .toEqual([third.id, second.id, first.id])
   })
 
   it('rejects a malformed backup before changing local data', async () => {

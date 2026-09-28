@@ -1088,19 +1088,11 @@ body {
 
   
 
-.folder-item:hover .folder-actions {
+.folder-item:hover .folder-actions,
+.folder-item:focus-within .folder-actions,
+.folder-actions-edit {
 
   opacity: 1;
-
-}
-
-  
-
-/* 编辑状态下隐藏操作按钮 */
-
-.folder-item:has(.folder-edit-input) .folder-actions {
-
-  display: none;
 
 }
 
@@ -2976,6 +2968,12 @@ body {
 
   }
 
+  .folder-actions {
+
+    opacity: 1;
+
+  }
+
   
 
   /* 移动端拖拽优化 */
@@ -3945,4 +3943,3 @@ body {
   }
 
 }
-

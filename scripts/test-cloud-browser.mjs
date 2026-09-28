@@ -129,6 +129,38 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
     check((await rows(b, 'notes', accounts[0].id)).length === 0, 'Other account leaked into browser storage')
     pass('UI pasted text reaches the second browser unchanged; another account cannot see it')
 
+    step = 'Reorder, rename, move and delete folders through the UI on a real account'
+    for (const name of ['云端甲', '云端乙', '云端丙']) {
+      await a1.getByTitle('新建文件夹').click()
+      await a1.getByLabel('新文件夹名称').fill(name)
+      await a1.locator('.folder-create-form button[type="submit"]').click()
+      await wait.poll(async () => (await rows(a1, 'folders')).some(row => row.name === name)).toBe(true)
+    }
+    const folderRows = await rows(a1, 'folders')
+    const firstFolder = folderRows.find(row => row.name === '云端甲')
+    const thirdFolder = folderRows.find(row => row.name === '云端丙')
+    check(firstFolder && thirdFolder, 'Created folders missing locally')
+    await a1.locator('.folder-item:not(.system-folder)').filter({ hasText: '云端丙' }).getByTitle('上移文件夹').click()
+    await wait.poll(async () => (await rows(a1, 'folders')).find(row => row.id === thirdFolder.id)?.sortOrder).toBe(1)
+    const renamed = a1.locator('.folder-item:not(.system-folder)').filter({ hasText: '云端丙' })
+    await renamed.getByTitle('重命名').click()
+    await a1.getByLabel('重命名文件夹').fill('云端新分类')
+    await a1.getByTitle('保存文件夹名称').click()
+    await wait.poll(async () => (await rows(a1, 'folders')).find(row => row.id === thirdFolder.id)?.name).toBe('云端新分类')
+    await item(a1).getByRole('combobox', { name: `移动便签 ${title} 到文件夹` }).selectOption(thirdFolder.id)
+    await wait.poll(async () => (await note(a1, noteId))?.folderId).toBe(thirdFolder.id)
+    await sync(a1)
+    await sync(a2)
+    check((await rows(a2, 'folders')).filter(row => !row.deletedAt).sort((a, b) => a.sortOrder - b.sortOrder).map(row => row.name).join(',') === '云端甲,云端新分类,云端乙', 'Folder order or name did not reach the second browser')
+    check((await note(a2, noteId))?.folderId === thirdFolder.id, 'Moved note did not reach the second browser')
+    await a1.locator('.folder-item:not(.system-folder)').filter({ hasText: '云端新分类' }).getByTitle('删除文件夹').click()
+    await wait.poll(async () => (await note(a1, noteId))?.folderId).toBeNull()
+    await sync(a1)
+    await sync(a2)
+    check((await rows(a2, 'folders')).find(row => row.id === thirdFolder.id)?.deletedAt, 'Folder deletion did not reach the second browser')
+    check((await note(a2, noteId))?.folderId === null && (await note(a2, noteId))?.deletedAt === null, 'Deleting a folder lost or hid its note')
+    pass('Folder reorder, rename and deletion synchronize while keeping the note in All Notes')
+
     step = 'Reload and edit while online but Auth returns 503'
     const authApi = `${projectUrl}/auth/v1/**`
     const blockedDataApi = `${projectUrl}/rest/v1/**`
@@ -362,6 +394,9 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
     await contexts[0].route(dataApi, route => route.abort())
     await closePanel(a1)
     // This tab was intentionally locked by the earlier device-clear test.
+    await sibling.reload()
+    await wait.poll(async () => await sibling.getByRole('heading', { name: '欢迎使用' }).isVisible() ||
+      await sibling.getByRole('button', { name: '退出登录' }).isVisible()).toBe(true)
     if (await sibling.getByRole('heading', { name: '欢迎使用' }).isVisible()) await login(sibling, accounts[0])
     await wait(sibling.getByRole('button', { name: '退出登录' })).toBeVisible()
     await sibling.evaluate(() => navigator.serviceWorker.ready)

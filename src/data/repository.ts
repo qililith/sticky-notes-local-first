@@ -139,6 +139,30 @@ export async function updateFolder(ownerId: string, folderId: string, change: Pa
   })
 }
 
+export async function reorderFolders(ownerId: string, orderedIds: string[], expectedOrderIds: string[]): Promise<void> {
+  requireOwner(ownerId)
+  await db.transaction('rw', db.folders, db.outbox, db.conflicts, async () => {
+    requireWritableOwner(ownerId)
+    const active = (await db.folders.where('ownerId').equals(ownerId).toArray()).filter(folder => !folder.deletedAt)
+    if (orderedIds.length !== active.length || new Set(orderedIds).size !== active.length ||
+      active.some(folder => !orderedIds.includes(folder.id))) throw new Error('文件夹列表已变化，请重新排序')
+    const currentOrder = [...active].sort((a, b) => a.sortOrder - b.sortOrder || a.id.localeCompare(b.id)).map(folder => folder.id)
+    if (currentOrder.length !== expectedOrderIds.length || currentOrder.some((id, index) => id !== expectedOrderIds[index])) {
+      throw new Error('文件夹顺序已在其他窗口变化，请重新排序')
+    }
+    const byId = new Map(active.map(folder => [folder.id, folder]))
+    const stamp = now()
+    for (const [index, folderId] of orderedIds.entries()) {
+      const current = byId.get(folderId)!
+      if (current.sortOrder === index) continue
+      const next = { ...current, sortOrder: index, localRev: current.localRev + 1, updatedAt: stamp }
+      await db.folders.put(next)
+      await queueMutation('folder', next)
+      await refreshConflictLocal('folder', next)
+    }
+  })
+}
+
 export async function deleteFolder(ownerId: string, folderId: string): Promise<void> {
   requireOwner(ownerId)
   await db.transaction('rw', db.folders, db.notes, db.outbox, db.conflicts, async () => {
@@ -192,4 +216,3 @@ export async function clearAccountFromDevice(ownerId: string): Promise<void> {
     throw error
   }
 }
-

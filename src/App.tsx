@@ -1,6 +1,6 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useLiveQuery } from 'dexie-react-hooks'
-import { ArrowLeft, Check, ChevronDown, ChevronRight, Database, FileText, GripVertical, LogOut, Menu, Moon, Pencil, Pin, Plus, Search, StickyNote, Sun, Trash2, User, X } from 'lucide-react'
+import { ArrowDown, ArrowLeft, ArrowUp, Check, ChevronDown, ChevronRight, Database, FileText, GripVertical, LogOut, Menu, Moon, Pencil, Pin, Plus, Search, StickyNote, Sun, Trash2, User, X } from 'lucide-react'
 import { toast, Toaster } from 'sonner'
 import type { User as AuthUser } from '@supabase/supabase-js'
 import { accountKey, demoMode, forgetAccount, getRememberedAccount, rememberAccount, supabase } from './auth'
@@ -8,7 +8,7 @@ import { db } from './data/db'
 import { accountClearedEventKey, isAccountSyncPaused, resumeAccountSync } from './data/accountSyncGate'
 import { MAX_FOLDER_NAME_LENGTH } from './data/limits'
 import { hasPendingEditorWrites, hasUnresolvedEditorDraft, setUnresolvedEditorDraft, subscribeEditorSafety } from './data/saveGuard'
-import { createFolder, createNote, createNoteWithContent, deleteFolder, setNoteContent, updateFolder, updateNote } from './data/repository'
+import { createFolder, createNote, createNoteWithContent, deleteFolder, reorderFolders, setNoteContent, updateFolder, updateNote } from './data/repository'
 import type { Folder, Note, RichText } from './data/types'
 import { startSync } from './sync/engine'
 import { PwaUpdatePrompt } from './components/PwaUpdatePrompt'
@@ -144,6 +144,20 @@ function NotesWorkspace({ account, onLogout, sessionEnded, onDiscardDraft }: { a
     catch (cause) { toast.error(cause instanceof Error ? cause.message : '操作失败') }
   }
 
+  const moveFolder = (sourceId: string, targetId: string) => {
+    const expectedOrder = activeFolders.map(folder => folder.id)
+    const ordered = [...expectedOrder]
+    const source = ordered.indexOf(sourceId)
+    const target = ordered.indexOf(targetId)
+    if (source < 0 || target < 0 || source === target) return
+    ordered.splice(target, 0, ordered.splice(source, 1)[0])
+    void act(() => reorderFolders(account.id, ordered, expectedOrder))
+  }
+
+  const saveFolderName = (id: string) => {
+    void act(async () => { await updateFolder(account.id, id, { name: editingName }); setEditingFolderId(null) }, '已重命名')
+  }
+
   const selectFolder = (id: string | null) => { if (!canLeaveEditor()) return; setFolderId(id); setQuery(''); setNoteId(null); setSidebarOpen(false); setMobileView('list') }
   const chooseNote = (note: Note) => { if (note.deletedAt || note.id !== noteId && !canLeaveEditor()) return; setNoteId(note.id); if (isMobile) setMobileView('editor') }
   const selectedFolderName = folderId === trashId ? '回收站' : activeFolders.find(folder => folder.id === folderId)?.name ?? '全部便签'
@@ -165,14 +179,12 @@ function NotesWorkspace({ account, onLogout, sessionEnded, onDiscardDraft }: { a
           {foldersExpanded && <div className="folder-list-content">
             {creatingFolder && <form className="folder-create-form" onSubmit={event => { event.preventDefault(); void act(async () => { await createFolder(account.id, newFolderName); setCreatingFolder(false); setNewFolderName('') }, '文件夹已创建') }}><input className="folder-create-input" autoFocus placeholder="文件夹名称" aria-label="新文件夹名称" title={`名称最多 ${MAX_FOLDER_NAME_LENGTH} 个字符`} maxLength={MAX_FOLDER_NAME_LENGTH} value={newFolderName} onChange={event => setNewFolderName(event.target.value)} /><button type="submit" className="btn-icon-sm success" title="创建"><Check size={14} /></button><button type="button" className="btn-icon-sm" title="取消" onClick={() => setCreatingFolder(false)}><X size={14} /></button></form>}
             <div className={`folder-item system-folder ${folderId === null ? 'active' : ''}`} onClick={() => selectFolder(null)}><span className="folder-item-name">全部便签</span></div>
-            {activeFolders.map(folder => <div key={folder.id} className={`folder-item ${folderId === folder.id ? 'active' : ''}`} draggable onDragStart={event => event.dataTransfer.setData('text/plain', folder.id)} onDragOver={event => event.preventDefault()} onDrop={event => {
-              event.preventDefault(); const sourceId = event.dataTransfer.getData('text/plain'); if (!sourceId || sourceId === folder.id) return
-              const ordered = [...activeFolders]; const source = ordered.findIndex(item => item.id === sourceId); const target = ordered.findIndex(item => item.id === folder.id)
-              if (source < 0 || target < 0) return; ordered.splice(target, 0, ordered.splice(source, 1)[0]); void act(async () => { for (let index = 0; index < ordered.length; index++) if (ordered[index].sortOrder !== index) await updateFolder(account.id, ordered[index].id, { sortOrder: index }) })
-            }} onClick={() => selectFolder(folder.id)}>
+            {activeFolders.map((folder, index) => <div key={folder.id} className={`folder-item ${folderId === folder.id ? 'active' : ''}`} draggable={editingFolderId !== folder.id} onDragStart={event => event.dataTransfer.setData('text/plain', folder.id)} onDragOver={event => event.preventDefault()} onDrop={event => {
+              event.preventDefault(); moveFolder(event.dataTransfer.getData('text/plain'), folder.id)
+            }} onClick={() => { if (editingFolderId !== folder.id) selectFolder(folder.id) }}>
               <GripVertical size={14} className="folder-drag-handle" />
-              {editingFolderId === folder.id ? <input className="folder-edit-input" autoFocus aria-label="重命名文件夹" title={`名称最多 ${MAX_FOLDER_NAME_LENGTH} 个字符`} maxLength={MAX_FOLDER_NAME_LENGTH} value={editingName} onClick={event => event.stopPropagation()} onChange={event => setEditingName(event.target.value)} onKeyDown={event => { if (event.key === 'Escape') setEditingFolderId(null); if (event.key === 'Enter') { event.preventDefault(); void act(() => updateFolder(account.id, folder.id, { name: editingName }), '已重命名'); setEditingFolderId(null) } }} /> : <span className="folder-item-name">{folder.name}</span>}
-              <div className="folder-actions"><button type="button" className="btn-icon-sm" title="重命名" onClick={event => { event.stopPropagation(); setEditingFolderId(folder.id); setEditingName(folder.name) }}><Pencil size={14} /></button><button type="button" className="btn-icon-sm danger" title="删除文件夹" onClick={event => { event.stopPropagation(); if (currentNote?.folderId === folder.id && !canLeaveEditor()) return; if (confirm('删除文件夹？其中的便签会保留在全部便签中。')) void act(async () => { await deleteFolder(account.id, folder.id); if (folderId === folder.id) selectFolder(null) }, '文件夹已删除') }}><Trash2 size={14} /></button></div>
+              {editingFolderId === folder.id ? <input className="folder-edit-input" autoFocus aria-label="重命名文件夹" title={`名称最多 ${MAX_FOLDER_NAME_LENGTH} 个字符`} maxLength={MAX_FOLDER_NAME_LENGTH} value={editingName} onClick={event => event.stopPropagation()} onChange={event => setEditingName(event.target.value)} onKeyDown={event => { if (event.key === 'Escape') setEditingFolderId(null); if (event.key === 'Enter') { event.preventDefault(); saveFolderName(folder.id) } }} /> : <span className="folder-item-name">{folder.name}</span>}
+              {editingFolderId === folder.id ? <div className="folder-actions folder-actions-edit"><button type="button" className="btn-icon-sm success" title="保存文件夹名称" onClick={event => { event.stopPropagation(); saveFolderName(folder.id) }}><Check size={14} /></button><button type="button" className="btn-icon-sm" title="取消重命名" onClick={event => { event.stopPropagation(); setEditingFolderId(null) }}><X size={14} /></button></div> : <div className="folder-actions"><button type="button" className="btn-icon-sm" title="上移文件夹" disabled={index === 0} onClick={event => { event.stopPropagation(); moveFolder(folder.id, activeFolders[index - 1].id) }}><ArrowUp size={14} /></button><button type="button" className="btn-icon-sm" title="下移文件夹" disabled={index === activeFolders.length - 1} onClick={event => { event.stopPropagation(); moveFolder(folder.id, activeFolders[index + 1].id) }}><ArrowDown size={14} /></button><button type="button" className="btn-icon-sm" title="重命名" onClick={event => { event.stopPropagation(); setEditingFolderId(folder.id); setEditingName(folder.name) }}><Pencil size={14} /></button><button type="button" className="btn-icon-sm danger" title="删除文件夹" onClick={event => { event.stopPropagation(); if (currentNote?.folderId === folder.id && !canLeaveEditor()) return; if (confirm('删除文件夹？其中的便签会保留在全部便签中。')) void act(async () => { await deleteFolder(account.id, folder.id); if (folderId === folder.id) selectFolder(null) }, '文件夹已删除') }}><Trash2 size={14} /></button></div>}
             </div>)}
             <div className={`folder-item system-folder ${folderId === trashId ? 'active' : ''}`} onClick={() => selectFolder(trashId)}><span className="folder-item-name">回收站</span></div>
           </div>}
