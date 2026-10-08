@@ -18,10 +18,13 @@ h1, h2, h3, h4, p { margin-top: 0; }
 .editor-content-shell { flex: 1; display: flex; width: 100%; }
 .editor-content-shell .editor-content { min-height: 100%; }
 .editor-content-shell .editor-content:focus { outline: none; }
+.editor-toolbar .editor-theme-toggle { flex-shrink: 0; }
 .editor-content ul[data-type="taskList"] { list-style: none; padding-left: 4px; }
 .editor-content ul[data-type="taskList"] li { display: flex; gap: 10px; align-items: flex-start; list-style: none; }
-.editor-content ul[data-type="taskList"] li > label { flex-shrink: 0; padding-top: 2px; }
+.editor-content ul[data-type="taskList"] li > label { display: flex; flex-shrink: 0; align-self: flex-start; align-items: center; min-height: 1.8em; padding: 0; }
+.editor-content ul[data-type="taskList"] li > label input[type="checkbox"] { display: block; }
 .editor-content ul[data-type="taskList"] li > div { flex: 1; min-width: 0; }
+.editor-content ul[data-type="taskList"] li > div > p { margin: 0; }
 .editor-content ul[data-type="taskList"] li[data-checked="true"] > div { color: var(--text-tertiary); text-decoration: line-through; }
 .toolbar-wrapper { display: flex; align-items: center; gap: 6px; }
 .editor-toolbar .toolbar-group { align-items: center; }
@@ -71,4 +74,3 @@ h1, h2, h3, h4, p { margin-top: 0; }
   .user-info, .btn-logout span { display: none; }
   .btn-logout { padding: 6px; }
 }
-

@@ -4,7 +4,7 @@ import { closeHistory } from '@tiptap/pm/history'
 import { Fragment, Slice } from '@tiptap/pm/model'
 import { toast } from 'sonner'
 import { createEditorExtensions } from '../data/editorSchema'
-import { Bold, CheckSquare, Heading1, Heading2, Heading3, Highlighter, Italic, List, ListOrdered, Maximize2, Minimize2, Plus, Redo2, Undo2 } from 'lucide-react'
+import { Bold, CheckSquare, Heading1, Heading2, Heading3, Highlighter, Italic, List, ListOrdered, Maximize2, Minimize2, Moon, Plus, Redo2, Sun, Undo2 } from 'lucide-react'
 import type { Note, RichText } from '../data/types'
 import { MAX_TITLE_LENGTH, titleWithSuffix } from '../data/limits'
 import { beginEditorWrite } from '../data/saveGuard'
@@ -21,9 +21,11 @@ type Props = {
   pendingCount: number
   hasConflict: boolean
   isMobile: boolean
+  theme: string
+  onToggleTheme: () => void
 }
 
-function EditorBody({ note, onEdit, onSaveCopy, onDiscardError, onCreate, onOpenConflicts, localError, syncError, pendingCount, hasConflict, isMobile }: Props & { note: Note }) {
+function EditorBody({ note, onEdit, onSaveCopy, onDiscardError, onCreate, onOpenConflicts, localError, syncError, pendingCount, hasConflict, isMobile, theme, onToggleTheme }: Props & { note: Note }) {
   const [title, setTitle] = useState(note.title)
   const titleRef = useRef(note.title)
   const titleInputRef = useRef<HTMLInputElement>(null)
@@ -162,6 +164,9 @@ function EditorBody({ note, onEdit, onSaveCopy, onDiscardError, onCreate, onOpen
         <span className="word-count">{wordCount} 字</span>
         <button type="button" className="toolbar-btn fullscreen-btn" title={fullscreen ? '退出全屏' : '全屏编辑'} onClick={() => setFullscreen(!fullscreen)}>
           {fullscreen ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
+        </button>
+        <button type="button" className="toolbar-btn editor-theme-toggle" aria-label="切换主题" title="切换主题" onClick={onToggleTheme}>
+          {theme === 'light' ? <Moon size={16} /> : <Sun size={16} />}
         </button>
       </div>
       <div className="editor-body">

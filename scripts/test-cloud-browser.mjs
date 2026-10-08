@@ -3,12 +3,14 @@ import { build, preview } from 'vite'
 
 // Called only by the opt-in cloud test runner. Admin keys never enter the browser.
 // All pages use temporary contexts; user browser profiles and the normal dev server are untouched.
-export async function runCloudBrowserChecks({ accounts, readClient, runId, projectUrl, setTestAccountBBan, revokeTestSession }) {
+export async function runCloudBrowserChecks({ accounts, readClient, runId, projectUrl, setTestAccountBBan, revokeTestSession, naturalExpiry = false, expiryDiagnostic = false }) {
+  if (naturalExpiry && expiryDiagnostic) throw new Error('Natural expiry and simulated expiry are mutually exclusive')
   let server
   let browser
   let restoreBuild = false
   let step = 'Build production PWA and start isolated preview'
   const pages = []
+  const transportFailures = new Map()
   const title = `网页联调-${runId.slice(0, 8)}`
   const textOne = '第一设备离线编辑，恢复联网后上传。'
   const textTwo = '第二设备独立修改，必须保留冲突双方。'
@@ -17,13 +19,68 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
   const pass = label => console.log(`PASS UI ${label}`)
   const wait = expect.configure({ timeout: 30_000 })
   const authStorageKey = `sb-${new URL(projectUrl).hostname.split('.')[0]}-auth-token`
+  const diagnosingExpiry = naturalExpiry || expiryDiagnostic
+  // Instrument only this test build. No tokens, IDs, payloads or raw SDK debug output.
+  const diagnosticPlugin = {
+    name: 'expiry-stage-diagnostics', enforce: 'pre',
+    transform(code, id) {
+      const path = id.replaceAll('\\', '/')
+      if (path.endsWith('/src/auth.ts')) {
+        return { code: code + `
+          supabase!.auth.onAuthStateChange(event => {
+            if (event === 'TOKEN_REFRESHED') window.dispatchEvent(new CustomEvent('expiry-stage', { detail: 'auth:refreshed' }))
+          })
+          ;(window as any).__expiryProbe = {
+            refresh: () => supabase!.auth.getSession().then(result => ({ ok: !result.error })),
+            state: () => {
+              const auth = supabase!.auth as any
+              return { refreshing: Boolean(auth.refreshingDeferred),
+                cooldownMs: Math.max(0, (auth.lastRefreshFailure?.expiresAt ?? 0) - Date.now()) }
+            }
+          }
+        `, map: null }
+      }
+      if (!path.endsWith('/src/sync/engine.ts')) return
+      const marks = [
+        ['const token = await tokenForAccount(ownerId)', "mark('session:start'); const token = await tokenForAccount(ownerId); mark('session:ready')"],
+        ['const run = async (): Promise<boolean> => {', "const run = async (): Promise<boolean> => { mark('lock:acquired')"],
+        ['await uploadOne(ownerId, item, token)', "{ mark('upload:start'); await uploadOne(ownerId, item, token); mark('upload:ack') }"],
+        ['await pull(ownerId, token)', "mark('pull:start'); await pull(ownerId, token); mark('pull:confirmed')"],
+        ['await setError(ownerId, describeError(cause))', "mark('sync:failed'); await setError(ownerId, describeError(cause))"],
+        ['return withAccountSyncLock(ownerId, run)', "mark('lock:waiting'); return withAccountSyncLock(ownerId, run)"],
+      ]
+      for (const [from, to] of marks) {
+        if (!code.includes(from)) throw new Error('Expiry diagnostic source marker missing')
+        code = code.replace(from, to)
+      }
+      return { code: `const mark = (stage: string) => window.dispatchEvent(new CustomEvent('expiry-stage', { detail: stage }));\n${code}`, map: null }
+    },
+  }
+
+  async function diagnosticSnapshot(page, label) {
+    if (!diagnosingExpiry) return
+    const state = await page.evaluate(async key => {
+      const locks = await navigator.locks.query()
+      const kind = lock => lock.name.startsWith('sticky-notes-sync:') ? 'sync' : lock.name.includes('auth-token') ? 'auth' : 'other'
+      const session = JSON.parse(localStorage.getItem(key) ?? 'null')
+      return { online: navigator.onLine, visibility: document.visibilityState,
+        expiresInSeconds: session ? Math.round(session.expires_at - Date.now() / 1000) : null,
+        ...window.__expiryProbe.state(),
+        heldLocks: locks.held.map(kind), waitingLocks: locks.pending.map(kind),
+        events: window.__expiryEvents }
+    }, authStorageKey)
+    const meta = (await rows(page, 'syncMeta'))[0]
+    console.log(`DIAG ${label} ${JSON.stringify({ ...state, pending: (await rows(page, 'outbox')).length,
+      confirmed: Boolean(meta?.lastSyncedAt), hasError: Boolean(meta?.lastError) })}`)
+  }
 
   async function requireRefresh(page) {
     // Force the SDK's expiry branch, not a forged JWT or a project-wide expiry change.
     await page.evaluate(key => {
       const session = JSON.parse(localStorage.getItem(key))
       if (!session?.refresh_token) throw new Error('No test session to refresh')
-      session.expires_at = 0
+      // Zero is treated as "expiry absent" by getSession(), not as expired.
+      session.expires_at = Math.floor(Date.now() / 1000) - 1
       localStorage.setItem(key, JSON.stringify(session))
     }, authStorageKey)
   }
@@ -83,13 +140,41 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
   }
 
   try {
-    await build()
+    if (diagnosingExpiry) restoreBuild = true
+    await build(diagnosingExpiry ? { plugins: [diagnosticPlugin] } : {})
     server = await preview({ preview: { host: '127.0.0.1', port: 4186, strictPort: true } })
     const address = 'http://127.0.0.1:4186'
     browser = await chromium.launch({ channel: 'chrome', headless: true })
     const contexts = await Promise.all([0, 1, 2].map(() => browser.newContext({ viewport: { width: 1440, height: 960 } })))
     for (const context of contexts) {
+      if (diagnosingExpiry) await context.addInitScript(({ origin }) => {
+        const events = window.__expiryEvents = []
+        const mark = (stage, status) => {
+          events.push({ at: Date.now(), stage, ...(status === undefined ? {} : { status }) })
+          if (events.length > 60) events.shift()
+        }
+        window.addEventListener('expiry-stage', event => mark(event.detail))
+        window.addEventListener('online', () => mark('network:online'))
+        window.addEventListener('offline', () => mark('network:offline'))
+        const originalFetch = window.fetch.bind(window)
+        window.fetch = async (input, init) => {
+          const url = new URL(input instanceof Request ? input.url : String(input), location.href)
+          if (url.origin !== origin) return originalFetch(input, init)
+          const service = url.pathname.includes('/token') ? 'auth:token' : url.pathname.startsWith('/auth/') ? 'auth:user' : 'data'
+          mark(`${service}:request`)
+          try { const response = await originalFetch(input, init); mark(`${service}:response`, response.status); return response }
+          catch (error) { mark(`${service}:transport-failed`); throw error }
+        }
+      }, { origin: new URL(projectUrl).origin })
       const page = await context.newPage()
+      transportFailures.set(page, [])
+      page.on('requestfailed', request => {
+        const url = new URL(request.url())
+        if (url.origin !== projectUrl) return
+        const failures = transportFailures.get(page)
+        failures.push({ service: url.pathname.startsWith('/auth/') ? 'auth' : 'data', error: request.failure()?.errorText })
+        if (failures.length > 5) failures.shift()
+      })
       page.setDefaultTimeout(30_000)
       page.on('dialog', dialog => void dialog.accept())
       pages.push(page)
@@ -104,6 +189,70 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
     await a1.reload()
     await a1.waitForFunction(() => Boolean(navigator.serviceWorker.controller))
     pass('Real email/password forms open isolated account workspaces')
+
+    if (diagnosingExpiry) {
+      step = naturalExpiry ? 'Wait for natural JWT expiry while retaining an offline note' : 'Retain offline note for simulated SDK expiry diagnostic'
+      const originalExpiry = await a1.evaluate(key => JSON.parse(localStorage.getItem(key) ?? 'null')?.expires_at, authStorageKey)
+      const jwtExpiry = await a1.evaluate(key => {
+        const session = JSON.parse(localStorage.getItem(key))
+        return JSON.parse(atob(session.access_token.split('.')[1].replaceAll('-', '+').replaceAll('_', '/'))).exp
+      }, authStorageKey)
+      check(originalExpiry === jwtExpiry, 'Stored expiry differs from the real JWT expiry')
+      const deadline = originalExpiry * 1000 + 3_000
+      check(Number.isFinite(deadline) && deadline > Date.now() && deadline - Date.now() < 7_200_000, 'Expected a real session expiring within two hours')
+      await contexts[0].setOffline(true)
+      await a1.getByTitle('新建便签', { exact: true }).click()
+      await a1.getByLabel('便签标题', { exact: true }).fill(title)
+      await a1.getByLabel('便签正文', { exact: true }).fill('自然到期期间离线保存的正文。')
+      await wait.poll(async () => (await rows(a1, 'notes')).find(row => row.title === title)?.plainText).toBe('自然到期期间离线保存的正文。')
+      const pendingId = (await rows(a1, 'notes')).find(row => row.title === title).id
+      if (expiryDiagnostic) {
+        // Short reproduction of the SDK refresh-failure path; NOT natural JWT expiry.
+        await requireRefresh(a1)
+        step = 'Reproduce an offline SDK refresh failure (simulated expiry metadata)'
+        check(!(await a1.evaluate(() => window.__expiryProbe.refresh())).ok, 'Offline refresh unexpectedly succeeded')
+        await diagnosticSnapshot(a1, 'offline-refresh-failed')
+      }
+      if (naturalExpiry) {
+      console.log(`WAIT Natural expiry until ${new Date(deadline).toISOString()}; no session values or credentials logged`)
+      let nextReport = Date.now() + 300_000
+      while (Date.now() < deadline) {
+        await new Promise(resolve => setTimeout(resolve, Math.min(30_000, deadline - Date.now())))
+        check(!a1.isClosed(), 'Natural-expiry browser closed unexpectedly')
+        if (Date.now() >= nextReport) {
+          console.log(`WAIT Natural expiry: ${Math.max(0, Math.ceil((deadline - Date.now()) / 60_000))} minutes remaining`)
+          nextReport = Date.now() + 300_000
+        }
+      }
+      }
+      await wait(a1.getByLabel('便签正文', { exact: true })).toHaveText('自然到期期间离线保存的正文。')
+      check((await rows(a1, 'outbox')).some(row => row.entityId === pendingId), 'Natural expiry removed the offline queue')
+      step = 'Reconnect and verify a new session after the SDK refresh cooldown'
+      transportFailures.set(a1, [])
+      const beforeSync = (await rows(a1, 'syncMeta'))[0]?.lastSyncedAt
+      const reconnectedAt = Date.now()
+      await contexts[0].setOffline(false)
+      await a1.evaluate(() => window.dispatchEvent(new Event('focus')))
+      await diagnosticSnapshot(a1, 'reconnected')
+      // auth-js 2.117.1 caches refresh failures for 60s and ticks every 30s.
+      // Observe that separate phase, then require prompt AUTOMATIC upload; no manual retry.
+      await expect.poll(() => a1.evaluate(key => JSON.parse(localStorage.getItem(key) ?? 'null')?.expires_at, authStorageKey), { timeout: 120_000 }).toBeGreaterThan(originalExpiry)
+      const refreshedAt = Date.now()
+      await diagnosticSnapshot(a1, 'session-refreshed')
+      step = 'Verify automatic upload and status confirmation within 10s of the new session'
+      await expect.poll(async () => {
+        const meta = (await rows(a1, 'syncMeta'))[0]
+        return (await rows(a1, 'outbox')).length === 0
+          && Boolean(meta?.lastSyncedAt && meta.lastSyncedAt !== beforeSync && !meta.lastError)
+      }, { timeout: 10_000 }).toBe(true)
+      console.log(`DIAG recovery timing: refresh=${refreshedAt - reconnectedAt}ms; automatic upload/confirmation=${Date.now() - refreshedAt}ms`)
+      await sync(a2)
+      step = 'Verify naturally expired offline edit on the second browser'
+      await wait.poll(async () => (await note(a2, pendingId))?.plainText).toBe('自然到期期间离线保存的正文。')
+      pass(`${naturalExpiry ? 'Natural JWT expiry' : 'Simulated expiry metadata'} retains offline edits; reconnect refreshes the session and synchronizes to another browser`)
+      await diagnosticSnapshot(a1, naturalExpiry ? 'natural-expiry-pass' : 'simulated-expiry-pass')
+      return
+    }
 
     step = 'Create through UI and exchange the note between browsers'
     await a1.getByTitle('新建便签', { exact: true }).click()
@@ -161,6 +310,46 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
     check((await note(a2, noteId))?.folderId === null && (await note(a2, noteId))?.deletedAt === null, 'Deleting a folder lost or hid its note')
     pass('Folder reorder, rename and deletion synchronize while keeping the note in All Notes')
 
+    step = 'Move an older offline edit into a newer offline folder and synchronize both'
+    await contexts[0].setOffline(true)
+    const moveNote = page => item(page).getByRole('combobox', { name: `移动便签 ${title} 到文件夹` })
+    await moveNote(a1).selectOption(firstFolder.id)
+    await wait.poll(async () => (await rows(a1, 'outbox')).some(row => row.entityId === noteId)).toBe(true)
+    await a1.getByTitle('新建文件夹').click()
+    await a1.getByLabel('新文件夹名称').fill('离线新分类')
+    await a1.locator('.folder-create-form button[type="submit"]').click()
+    await wait.poll(async () => (await rows(a1, 'folders')).some(row => row.name === '离线新分类')).toBe(true)
+    const offlineFolder = (await rows(a1, 'folders')).find(row => row.name === '离线新分类')
+    await moveNote(a1).selectOption(offlineFolder.id)
+    await wait.poll(async () => (await note(a1, noteId))?.folderId).toBe(offlineFolder.id)
+    await contexts[0].setOffline(false)
+    await sync(a1)
+    await sync(a2)
+    check((await rows(a1, 'outbox')).length === 0, 'New folder dependency left a rejected or pending note')
+    check((await note(a2, noteId))?.folderId === offlineFolder.id && (await note(a2, noteId))?.plainText === initialText, 'New folder move did not preserve and synchronize the note')
+    pass('An older queued note waits for its newly selected folder and reaches the second browser')
+
+    step = 'Recover an unsynced note after another device deletes its folder'
+    await contexts[0].setOffline(true)
+    const repairTitle = `受阻便签-${runId.slice(0, 8)}`
+    const repairText = '这条尚无云端历史的便签，修复后正文必须保留。'
+    await a1.getByTitle('新建便签', { exact: true }).click()
+    await a1.getByLabel('便签标题', { exact: true }).fill(repairTitle)
+    await a1.getByLabel('便签正文', { exact: true }).fill(repairText)
+    await wait.poll(async () => (await rows(a1, 'notes')).find(row => row.title === repairTitle)?.plainText).toBe(repairText)
+    const repairId = (await rows(a1, 'notes')).find(row => row.title === repairTitle).id
+    await item(a1, repairTitle).getByRole('combobox', { name: `移动便签 ${repairTitle} 到文件夹` }).selectOption(offlineFolder.id)
+    await wait.poll(async () => (await note(a1, repairId))?.folderId).toBe(offlineFolder.id)
+    await a2.locator('.folder-item:not(.system-folder)').filter({ hasText: '离线新分类' }).getByTitle('删除文件夹').click()
+    await sync(a2)
+    await contexts[0].setOffline(false)
+    await wait.poll(async () => (await rows(a1, 'outbox')).length).toBe(0)
+    await sync(a2)
+    check((await note(a1, repairId))?.folderId === null && (await note(a2, repairId))?.folderId === null, 'Folder repair did not reach both browsers')
+    check((await note(a1, repairId))?.plainText === repairText && (await note(a2, repairId))?.plainText === repairText, 'Folder repair changed the note body')
+    await item(a1).click()
+    pass('Deleted-folder recovery keeps the body, clears the queue and reaches the second browser')
+
     step = 'Reload and edit while online but Auth returns 503'
     const authApi = `${projectUrl}/auth/v1/**`
     const blockedDataApi = `${projectUrl}/rest/v1/**`
@@ -171,6 +360,8 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
     })
     await contexts[0].route(blockedDataApi, route => route.abort())
     await a1.reload()
+    // The folder-repair scenario added a newer note; reload selects it by default.
+    await item(a1).click()
     check(await a1.evaluate(() => navigator.onLine), 'Outage check must leave browser online')
     await wait(a1.getByLabel('便签正文', { exact: true })).toContainText('真实网页登录后的第一段正文。')
     await wait(a1.getByLabel('便签正文', { exact: true })).toContainText('<div>按原样保存</div> &amp;  **星号**')
@@ -199,6 +390,7 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
     pass('SDK expiry branch obtains a fresh real session and resumes sync (not a wall-clock JWT expiry test)')
 
     step = 'Edit both copies offline and reload the production PWA'
+    await item(a2).click()
     await Promise.all([contexts[0].setOffline(true), contexts[1].setOffline(true)])
     await a1.getByLabel('便签正文', { exact: true }).fill(textOne)
     await a2.getByLabel('便签正文', { exact: true }).fill(textTwo)
@@ -509,6 +701,8 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
         const state = await page.evaluate(() => ({ ready: document.readyState, upgraded: Boolean(document.documentElement.dataset.testBuild),
           save: document.querySelector('.save-status')?.textContent ?? null })).catch(() => null)
         console.error(`UI ${index}: workspace=${await page.locator('.app-layout').isVisible().catch(() => false)} login=${await page.getByRole('heading', { name: '欢迎使用' }).isVisible().catch(() => false)} state=${JSON.stringify(state)}`)
+        console.error(`UI ${index} transport failures: ${JSON.stringify(transportFailures.get(page) ?? [])}`)
+        await diagnosticSnapshot(page, `failure-browser-${index}`).catch(() => {})
       }
       if (!page.isClosed() && await page.locator('.app-layout').isVisible().catch(() => false)) {
         await page.screenshot({ path: `test-results/cloud-ui-failure-${index}.png`, fullPage: true }).catch(() => {})

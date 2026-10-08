@@ -51,7 +51,7 @@ export type Mutation = {
   localRev: number
   payload: NotePayload | FolderPayload
   createdAt: string
-  state: 'pending' | 'inflight' | 'conflict'
+  state: 'pending' | 'inflight' | 'conflict' | 'rejected'
   error?: string
 }
 
@@ -65,11 +65,18 @@ export type Conflict = {
   createdAt: string
 }
 
+export type DeferredChange = {
+  seq: string
+  entity: Entity
+  record: { id: string; owner_id: string; version: number } & Record<string, unknown>
+}
+
 export type SyncMeta = {
   ownerId: string
   cursor: string
   lastSyncedAt: string | null
   lastError: string | null
+  deferred?: DeferredChange[]
 }
 
 export type Revision = {
@@ -98,4 +105,3 @@ export function notePayload(note: Note): NotePayload {
 export function folderPayload(folder: Folder): FolderPayload {
   return { name: folder.name, sortOrder: folder.sortOrder, deletedAt: folder.deletedAt }
 }
-

@@ -9,7 +9,7 @@ importers:
   .:
     dependencies:
       '@supabase/supabase-js':
-        specifier: ^2.0.0
+        specifier: 2.117.1
         version: 2.117.1
       '@tiptap/extension-highlight':
         specifier: ^3.0.0

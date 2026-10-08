@@ -200,6 +200,8 @@ try {
     step = 'Production browser UI checks'
     const { runCloudBrowserChecks } = await import('./test-cloud-browser.mjs')
     await runCloudBrowserChecks({ accounts, readClient: a2, runId, projectUrl: env.VITE_SUPABASE_URL,
+      naturalExpiry: process.argv.includes('--natural-expiry'),
+      expiryDiagnostic: process.argv.includes('--expiry-diagnostic'),
       setTestAccountBBan: async banned => {
         ok(await admin.auth.admin.updateUserById(accounts[1].id, { ban_duration: banned ? '1h' : 'none' }), 'Test-account ban update failed')
       },

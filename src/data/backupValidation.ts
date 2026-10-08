@@ -62,7 +62,7 @@ export function validateBackup(value: unknown): BackupArchive {
   for (const row of value.notes as Row[]) requireValid(row.folderId === null || folderIds.has(row.folderId), '便签缺少所属文件夹')
   for (const row of value.pending as Row[]) {
     requireValid(uuid(row.id) && uuid(row.entityId) && counter(row.baseVersion) && counter(row.localRev)
-      && Number(row.localRev) >= 1 && date(row.createdAt) && typeof row.state === 'string' && ['pending', 'inflight', 'conflict'].includes(row.state)
+      && Number(row.localRev) >= 1 && date(row.createdAt) && typeof row.state === 'string' && ['pending', 'inflight', 'conflict', 'rejected'].includes(row.state)
       && (row.error === undefined || typeof row.error === 'string') && object(row.payload), '待上传记录')
     if (row.entity === 'note') notePayload(row.payload, '待上传便签')
     else { requireValid(row.entity === 'folder', '待上传类型'); folderPayload(row.payload, '待上传文件夹') }
