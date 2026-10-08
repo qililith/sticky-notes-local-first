@@ -36,6 +36,8 @@ export function DataPanel({ ownerId, note, hasUnsavedDraft, onClose, onCleared }
   }, [])
   const meta = useLiveQuery(() => db.syncMeta.get(ownerId), [ownerId])
   const outbox = useLiveQuery(() => db.outbox.where('ownerId').equals(ownerId).toArray(), [ownerId], []) ?? []
+  const pending = outbox.filter(item => item.state === 'pending' || item.state === 'inflight')
+  const rejected = outbox.filter(item => item.state === 'rejected')
   const conflicts = useLiveQuery(() => db.conflicts.where('ownerId').equals(ownerId).toArray(), [ownerId], []) ?? []
   const history = useLiveQuery(() => note ? db.history.where('[ownerId+noteId]').equals([ownerId, note.id]).reverse().sortBy('serverVersion') : [], [ownerId, note?.id], []) ?? []
 
@@ -62,11 +64,27 @@ export function DataPanel({ ownerId, note, hasUnsavedDraft, onClose, onCleared }
     <section className="data-panel" role="dialog" aria-modal="true" aria-label="数据与同步" onClick={event => event.stopPropagation()}>
       <div className="data-panel-heading"><h2>数据与同步</h2><button type="button" onClick={onClose} aria-label="关闭">×</button></div>
       <section><h3>状态</h3>
-        <p>{supabase ? online ? '设备在线' : '设备离线' : '本地演示，不连接云端'} · 待同步 {outbox.length} 项 · 待处理冲突 {conflicts.length} 项</p>
+        <p>{supabase ? online ? '设备在线' : '设备离线' : '本地演示，不连接云端'} · 待同步 {pending.length} 项 · 需处理 {rejected.length} 项 · 待处理冲突 {conflicts.length} 项</p>
         {meta?.lastSyncedAt && <p>上次同步：{new Date(meta.lastSyncedAt).toLocaleString('zh-CN')}</p>}
         {meta?.lastError && <p className="panel-error">同步错误：{meta.lastError}</p>}
         {storage && <p>{storage}</p>}
         <button type="button" disabled={busy || !online || !supabase} onClick={() => void run(async () => { if (!await syncOnce(ownerId)) throw new Error('同步未成功，请查看上方错误') }, '本轮同步检查已完成')}>立即重试同步</button>
+      </section>
+      <section><h3>需处理</h3>
+        {rejected.length === 0 ? <p>没有被云端拒绝、需要修改后再同步的记录。</p> : rejected.map(item => <div className="panel-card" key={item.id}>
+          <p>{item.entity === 'note' ? '便签' : '文件夹'}：{'title' in item.payload ? item.payload.title || '无标题' : item.payload.name}</p>
+          <p>仍在本机，云端未接受这一版。</p>
+          <p className="panel-error">{item.error ?? '云端拒绝了这次上传。'}</p>
+          {item.entity === 'note' && item.error?.includes('便签所选文件夹') ? <>
+            <p>此按钮只修改这条便签的分类，标题和正文保留。重命名文件夹不会修复这条便签的关联。</p>
+            {conflicts.some(conflict => conflict.entity === item.entity && conflict.entityId === item.entityId) && <p>这条便签同时存在同步冲突，请先在下方选择保留的版本。</p>}
+            <button type="button" disabled={busy || hasUnsavedDraft || conflicts.some(conflict => conflict.entity === item.entity && conflict.entityId === item.entityId)} onClick={() => void run(async () => {
+              if (hasPendingEditorWrites() || hasUnresolvedEditorDraft()) throw new Error('当前草稿尚未保存，请先处理后再移动便签')
+              await updateNote(ownerId, item.entityId, { folderId: null })
+              if (supabase && online && !await syncOnce(ownerId)) throw new Error('已移到未分类；同步尚未成功，请查看上方错误')
+            }, '已移到未分类')}>移到未分类并重试</button>
+          </> : <p>请按错误说明修改这条记录后重试。其他便签会继续同步。</p>}
+        </div>)}
       </section>
       <section><h3>冲突</h3>
         {conflicts.length === 0 ? <p>没有待处理冲突。</p> : conflicts.map(item => <div className="panel-card" key={item.id}>

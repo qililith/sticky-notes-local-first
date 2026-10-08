@@ -25,10 +25,12 @@ function requireWritableOwner(ownerId: string) {
 
 async function queueMutation(entity: Entity, value: Note | Folder): Promise<void> {
   const existing = await db.outbox.where('[ownerId+entity+entityId]').equals([value.ownerId, entity, value.id]).toArray()
-  const editable = existing.find(item => item.state === 'pending')
+  const editable = existing.find(item => item.state === 'pending' || item.state === 'rejected')
   const payload = entity === 'note' ? notePayload(value as Note) : folderPayload(value as Folder)
   if (editable) {
-    await db.outbox.put({ ...editable, localRev: value.localRev, payload })
+    const next = { ...editable, localRev: value.localRev, payload, state: 'pending' as const }
+    delete next.error
+    await db.outbox.put(next)
   } else {
     const mutation: Mutation = {
       id: id(), ownerId: value.ownerId, entity, entityId: value.id,
@@ -173,14 +175,19 @@ export async function deleteFolder(ownerId: string, folderId: string): Promise<v
     await db.folders.put(nextFolder)
     await queueMutation('folder', nextFolder)
     await refreshConflictLocal('folder', nextFolder)
-    const notes = await db.notes.where('[ownerId+folderId]').equals([ownerId, folderId]).toArray()
-    for (const note of notes) {
-      const nextNote = { ...note, folderId: null, localRev: note.localRev + 1, updatedAt: now() }
-      await db.notes.put(nextNote)
-      await queueMutation('note', nextNote)
-      await refreshConflictLocal('note', nextNote)
-    }
+    await detachNotesFromFolder(ownerId, folderId)
   })
+}
+
+export async function detachNotesFromFolder(ownerId: string, folderId: string): Promise<void> {
+  const notes = await db.notes.where('[ownerId+folderId]').equals([ownerId, folderId]).toArray()
+  for (const note of notes) {
+    if (note.ownerId !== ownerId) continue
+    const nextNote = { ...note, folderId: null, localRev: note.localRev + 1, updatedAt: now() }
+    await db.notes.put(nextNote)
+    await queueMutation('note', nextNote)
+    await refreshConflictLocal('note', nextNote)
+  }
 }
 
 export async function clearAccountFromDevice(ownerId: string): Promise<void> {

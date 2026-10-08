@@ -11,3 +11,5 @@ test-results/
 *.tsbuildinfo
 supabase/.temp/
 supabase/.branches/
+site-preview/
+site-preview-deployment.tar.gz
