@@ -1,6 +1,6 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useLiveQuery } from 'dexie-react-hooks'
-import { ArrowDown, ArrowLeft, ArrowUp, Check, ChevronDown, ChevronRight, Database, FileText, GripVertical, LogOut, Menu, Pencil, Pin, Plus, Search, StickyNote, Trash2, User, X } from 'lucide-react'
+import { ArrowLeft, Check, ChevronDown, ChevronRight, Database, FileText, GripVertical, LogOut, Menu, Moon, PanelLeftClose, PanelLeftOpen, Pencil, Pin, Plus, Search, StickyNote, Sun, Trash2, User, X } from 'lucide-react'
 import { toast, Toaster } from 'sonner'
 import type { User as AuthUser } from '@supabase/supabase-js'
 import { accountKey, demoMode, forgetAccount, getRememberedAccount, rememberAccount, supabase } from './auth'
@@ -9,7 +9,7 @@ import { accountClearedEventKey, isAccountSyncPaused, resumeAccountSync } from '
 import { MAX_FOLDER_NAME_LENGTH } from './data/limits'
 import { hasPendingEditorWrites, hasUnresolvedEditorDraft, setUnresolvedEditorDraft, subscribeEditorSafety } from './data/saveGuard'
 import { createFolder, createNote, createNoteWithContent, deleteFolder, reorderFolders, setNoteContent, updateFolder, updateNote } from './data/repository'
-import type { Folder, Note, RichText } from './data/types'
+import type { Note, RichText } from './data/types'
 import { startSync } from './sync/engine'
 import { PwaUpdatePrompt } from './components/PwaUpdatePrompt'
 
@@ -25,7 +25,7 @@ function Login({ onLogin, onDemo }: { onLogin: (email: string, password: string)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
   return <div className="login-page"><div className="login-container">
-    <div className="login-brand"><div className="brand-logo"><StickyNote size={48} /></div><h1 className="brand-title">便签工具</h1><p className="brand-subtitle">简单、优雅地记录想法</p></div>
+    <div className="login-brand"><div className="brand-logo"><StickyNote size={48} /></div><h1 className="brand-title">便签</h1><p className="brand-subtitle">简单、优雅地记录想法</p></div>
     <div className="login-form"><form className="login-card" onSubmit={async event => {
       event.preventDefault(); setBusy(true); setError('')
       try { await onLogin(email, password) } catch (cause) { setError(cause instanceof Error ? cause.message : '登录失败') } finally { setBusy(false) }
@@ -56,6 +56,7 @@ function NotesWorkspace({ account, onLogout, sessionEnded, onDiscardDraft }: { a
   const [isMobile, setIsMobile] = useState(() => window.matchMedia('(max-width: 640px)').matches)
   const [mobileView, setMobileView] = useState<'list' | 'editor'>('list')
   const [sidebarOpen, setSidebarOpen] = useState(false)
+  const [desktopSidebarOpen, setDesktopSidebarOpen] = useState(true)
   const [foldersExpanded, setFoldersExpanded] = useState(true)
   const [folderId, setFolderId] = useState<string | null>(null)
   const [noteId, setNoteId] = useState<string | null>(null)
@@ -64,6 +65,9 @@ function NotesWorkspace({ account, onLogout, sessionEnded, onDiscardDraft }: { a
   const [newFolderName, setNewFolderName] = useState('')
   const [editingFolderId, setEditingFolderId] = useState<string | null>(null)
   const [editingName, setEditingName] = useState('')
+  const folderCreateBusyRef = useRef(false)
+  const folderCreateCancelRef = useRef(false)
+  const folderRenameHandledRef = useRef(false)
   const [localError, setLocalError] = useState<{ noteId: string; message: string } | null>(null)
   const [dataPanelOpen, setDataPanelOpen] = useState(false)
   const [creatingNote, setCreatingNote] = useState(false)
@@ -158,7 +162,36 @@ function NotesWorkspace({ account, onLogout, sessionEnded, onDiscardDraft }: { a
   }
 
   const saveFolderName = (id: string) => {
-    void act(async () => { await updateFolder(account.id, id, { name: editingName }); setEditingFolderId(null) }, '已重命名')
+    if (!editingName.trim()) { setEditingFolderId(null); return }
+    const name = editingName
+    folderRenameHandledRef.current = true
+    setEditingFolderId(null)
+    void act(() => updateFolder(account.id, id, { name }), '已重命名')
+  }
+
+  const createFolderAtTop = () => {
+    if (folderCreateBusyRef.current) return
+    const name = newFolderName.trim()
+    if (!name) { setCreatingFolder(false); setNewFolderName(''); return }
+    const previousOrder = activeFolders.map(folder => folder.id)
+    folderCreateBusyRef.current = true
+    folderCreateCancelRef.current = false
+    void (async () => {
+      try {
+        const folder = await createFolder(account.id, name)
+        setCreatingFolder(false)
+        setNewFolderName('')
+        await reorderFolders(account.id, [folder.id, ...previousOrder], [...previousOrder, folder.id])
+        toast.success('文件夹已创建')
+      } catch (cause) { toast.error(cause instanceof Error ? cause.message : '创建文件夹失败') }
+      finally { folderCreateBusyRef.current = false }
+    })()
+  }
+
+  const cancelFolderCreation = () => {
+    folderCreateCancelRef.current = true
+    setCreatingFolder(false)
+    setNewFolderName('')
   }
 
   const selectFolder = (id: string | null) => { if (!canLeaveEditor()) return; setFolderId(id); setQuery(''); setNoteId(null); setSidebarOpen(false); setMobileView('list') }
@@ -166,50 +199,53 @@ function NotesWorkspace({ account, onLogout, sessionEnded, onDiscardDraft }: { a
   const selectedFolderName = folderId === trashId ? '回收站' : activeFolders.find(folder => folder.id === folderId)?.name ?? '全部便签'
 
   return <div className={`app-layout ${sessionEnded ? 'session-ended' : ''}`}>
-    <header className="app-header">
+    {isMobile && <header className="app-header">
       {isMobile && <button type="button" className="btn-menu" aria-label={mobileView === 'editor' ? '返回列表' : '打开菜单'} onClick={() => mobileView === 'editor' ? canLeaveEditor() && setMobileView('list') : setSidebarOpen(true)}>
         {mobileView === 'editor' ? <ArrowLeft size={20} /> : <Menu size={20} />}
       </button>}
-      <div className="app-brand"><StickyNote size={24} /><h1>便签工具</h1></div>
+      <div className="app-brand"><StickyNote size={24} /><h1>便签</h1></div>
       <div className="app-actions"><button type="button" className="btn-theme data-status-button" aria-label={conflicts.length ? `数据与同步，${conflicts.length} 项冲突` : rejectedCount ? `数据与同步，${rejectedCount} 项需处理` : syncError ? '数据与同步，同步失败' : '数据与同步'} title="数据与同步" onClick={() => setDataPanelOpen(true)}><Database size={18} />{(conflicts.length > 0 || rejectedCount > 0 || syncError) && <span className="conflict-badge" aria-hidden="true">{conflicts.length || rejectedCount || '!'}</span>}</button></div>
       <div className="app-user"><div className="user-info" title={account.email}><User size={18} /></div><button type="button" className="btn-logout" aria-label="退出登录" title="退出登录" onClick={() => { if (canLeaveEditor()) void onLogout() }}><LogOut size={18} /><span>退出</span></button></div>
-    </header>
+    </header>}
     {sessionEnded && <div className="session-ended-banner" role="alert"><span>当前账号已退出或切换。请先处理草稿；本地保存完成后会自动退出。</span>{hasUnsavedDraft && <button type="button" onClick={onDiscardDraft}>草稿已复制，退出</button>}</div>}
     {isMobile && sidebarOpen && <div className="sidebar-overlay" aria-hidden="true" onClick={() => setSidebarOpen(false)} />}
     <div className="app-main">
-      <aside className={`app-sidebar ${isMobile ? 'mobile-sidebar' : ''} ${sidebarOpen ? 'open' : ''}`}>
-        <div className="folder-list"><div className="folder-list-header"><button type="button" className="folder-list-title-btn" onClick={() => setFoldersExpanded(!foldersExpanded)}><h3 className="folder-list-title">文件夹</h3>{foldersExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}</button><button type="button" className="btn-icon btn-ghost" title="新建文件夹" onClick={() => setCreatingFolder(true)}><Plus size={14} /></button></div>
+      <aside className={`app-sidebar ${isMobile ? 'mobile-sidebar' : ''} ${sidebarOpen ? 'open' : ''} ${!isMobile && !desktopSidebarOpen ? 'desktop-collapsed' : ''}`} aria-hidden={!isMobile && !desktopSidebarOpen}>
+        <div className="folder-list">
+          <div className="sidebar-top-row"><button type="button" className={`folder-item system-folder all-notes-item ${folderId === null ? 'active' : ''}`} onClick={() => selectFolder(null)}><span className="folder-item-name">全部便签</span></button>{!isMobile && desktopSidebarOpen && <button type="button" className="btn-icon btn-ghost sidebar-collapse-btn" title="收起侧栏" aria-label="收起侧栏" onClick={() => setDesktopSidebarOpen(false)}><PanelLeftClose size={15} /></button>}</div>
+          <div className="folder-list-header"><button type="button" className="folder-list-title-btn" aria-expanded={foldersExpanded} onClick={() => setFoldersExpanded(!foldersExpanded)}>{foldersExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}<h3 className="folder-list-title">文件夹</h3></button><button type="button" className="btn-icon btn-ghost folder-add-btn" title="新建文件夹" aria-label="新建文件夹" onClick={() => { folderCreateCancelRef.current = false; setCreatingFolder(true) }}><Plus size={14} /></button></div>
           {foldersExpanded && <div className="folder-list-content">
-            {creatingFolder && <form className="folder-create-form" onSubmit={event => { event.preventDefault(); void act(async () => { await createFolder(account.id, newFolderName); setCreatingFolder(false); setNewFolderName('') }, '文件夹已创建') }}><input className="folder-create-input" autoFocus placeholder="文件夹名称" aria-label="新文件夹名称" title={`名称最多 ${MAX_FOLDER_NAME_LENGTH} 个字符`} maxLength={MAX_FOLDER_NAME_LENGTH} value={newFolderName} onChange={event => setNewFolderName(event.target.value)} /><button type="submit" className="btn-icon-sm success" title="创建"><Check size={14} /></button><button type="button" className="btn-icon-sm" title="取消" onClick={() => setCreatingFolder(false)}><X size={14} /></button></form>}
-            <div className={`folder-item system-folder ${folderId === null ? 'active' : ''}`} onClick={() => selectFolder(null)}><span className="folder-item-name">全部便签</span></div>
-            {activeFolders.map((folder, index) => <div key={folder.id} className={`folder-item ${folderId === folder.id ? 'active' : ''}`} draggable={editingFolderId !== folder.id} onDragStart={event => event.dataTransfer.setData('text/plain', folder.id)} onDragOver={event => event.preventDefault()} onDrop={event => {
+            {creatingFolder && <form className="folder-create-form" onSubmit={event => { event.preventDefault(); createFolderAtTop() }}><input className="folder-create-input" autoFocus placeholder="输入文件夹名称" aria-label="新文件夹名称" title={`按 Enter 创建，按 Escape 取消；名称最多 ${MAX_FOLDER_NAME_LENGTH} 个字符`} maxLength={MAX_FOLDER_NAME_LENGTH} value={newFolderName} onChange={event => setNewFolderName(event.target.value)} onBlur={() => { if (folderCreateCancelRef.current) { folderCreateCancelRef.current = false; return } createFolderAtTop() }} onKeyDown={event => { if (event.key === 'Escape') cancelFolderCreation() }} /></form>}
+            {activeFolders.map(folder => <div key={folder.id} className={`folder-item ${folderId === folder.id ? 'active' : ''}`} draggable={editingFolderId !== folder.id} onDragStart={event => event.dataTransfer.setData('text/plain', folder.id)} onDragOver={event => event.preventDefault()} onDrop={event => {
               event.preventDefault(); moveFolder(event.dataTransfer.getData('text/plain'), folder.id)
             }} onClick={() => { if (editingFolderId !== folder.id) selectFolder(folder.id) }}>
               <GripVertical size={14} className="folder-drag-handle" />
-              {editingFolderId === folder.id ? <input className="folder-edit-input" autoFocus aria-label="重命名文件夹" title={`名称最多 ${MAX_FOLDER_NAME_LENGTH} 个字符`} maxLength={MAX_FOLDER_NAME_LENGTH} value={editingName} onClick={event => event.stopPropagation()} onChange={event => setEditingName(event.target.value)} onKeyDown={event => { if (event.key === 'Escape') setEditingFolderId(null); if (event.key === 'Enter') { event.preventDefault(); saveFolderName(folder.id) } }} /> : <span className="folder-item-name">{folder.name}</span>}
-              {editingFolderId === folder.id ? <div className="folder-actions folder-actions-edit"><button type="button" className="btn-icon-sm success" title="保存文件夹名称" onClick={event => { event.stopPropagation(); saveFolderName(folder.id) }}><Check size={14} /></button><button type="button" className="btn-icon-sm" title="取消重命名" onClick={event => { event.stopPropagation(); setEditingFolderId(null) }}><X size={14} /></button></div> : <div className="folder-actions"><button type="button" className="btn-icon-sm" title="上移文件夹" disabled={index === 0} onClick={event => { event.stopPropagation(); moveFolder(folder.id, activeFolders[index - 1].id) }}><ArrowUp size={14} /></button><button type="button" className="btn-icon-sm" title="下移文件夹" disabled={index === activeFolders.length - 1} onClick={event => { event.stopPropagation(); moveFolder(folder.id, activeFolders[index + 1].id) }}><ArrowDown size={14} /></button><button type="button" className="btn-icon-sm" title="重命名" onClick={event => { event.stopPropagation(); setEditingFolderId(folder.id); setEditingName(folder.name) }}><Pencil size={14} /></button><button type="button" className="btn-icon-sm danger" title="删除文件夹" onClick={event => { event.stopPropagation(); if (currentNote?.folderId === folder.id && !canLeaveEditor()) return; if (confirm('删除文件夹？其中的便签会保留在全部便签中。')) void act(async () => { await deleteFolder(account.id, folder.id); if (folderId === folder.id) selectFolder(null) }, '文件夹已删除') }}><Trash2 size={14} /></button></div>}
+              {editingFolderId === folder.id ? <input className="folder-edit-input" autoFocus aria-label="重命名文件夹" title={`按 Enter 保存，按 Escape 取消；名称最多 ${MAX_FOLDER_NAME_LENGTH} 个字符`} maxLength={MAX_FOLDER_NAME_LENGTH} value={editingName} onClick={event => event.stopPropagation()} onChange={event => setEditingName(event.target.value)} onBlur={() => { if (folderRenameHandledRef.current) { folderRenameHandledRef.current = false; return } saveFolderName(folder.id) }} onKeyDown={event => { if (event.key === 'Escape') { folderRenameHandledRef.current = true; setEditingFolderId(null) } if (event.key === 'Enter') { event.preventDefault(); saveFolderName(folder.id) } }} /> : <span className="folder-item-name">{folder.name}</span>}
+              {editingFolderId !== folder.id && <div className="folder-actions"><button type="button" className="btn-icon-sm" title="重命名" onClick={event => { event.stopPropagation(); folderRenameHandledRef.current = false; setEditingFolderId(folder.id); setEditingName(folder.name) }}><Pencil size={14} /></button><button type="button" className="btn-icon-sm danger" title="删除文件夹" onClick={event => { event.stopPropagation(); if (currentNote?.folderId === folder.id && !canLeaveEditor()) return; if (confirm('删除文件夹？其中的便签会保留在全部便签中。')) void act(async () => { await deleteFolder(account.id, folder.id); if (folderId === folder.id) selectFolder(null) }, '文件夹已删除') }}><Trash2 size={14} /></button></div>}
             </div>)}
-            <div className={`folder-item system-folder ${folderId === trashId ? 'active' : ''}`} onClick={() => selectFolder(trashId)}><span className="folder-item-name">回收站</span></div>
           </div>}
         </div>
         {!isMobile && <div className="sidebar-divider" />}
-        {!isMobile && <NoteList notes={visibleNotes} folders={activeFolders} currentNoteId={noteId} rejectedIds={rejectedIds} label={query ? '搜索结果' : selectedFolderName} isTrash={folderId === trashId} query={query} setQuery={setQuery} onCreate={() => void create()} onSelect={chooseNote} onDelete={note => { if (note.id === noteId && !canLeaveEditor()) return; void act(() => updateNote(account.id, note.id, { deletedAt: new Date().toISOString() }), '已移入回收站') }} onRestore={note => void act(() => updateNote(account.id, note.id, { deletedAt: null }), '已恢复')} onPin={note => { if (note.id === noteId && !canLeaveEditor()) return; void act(() => updateNote(account.id, note.id, { isPinned: !note.isPinned })) }} onMove={(note, destination) => { if (note.id === noteId && !canLeaveEditor()) return; void act(() => updateNote(account.id, note.id, { folderId: destination }), '已移动') }} />}
+        {!isMobile && <NoteList notes={visibleNotes} currentNoteId={noteId} rejectedIds={rejectedIds} label={query ? '搜索结果' : selectedFolderName} isTrash={folderId === trashId} query={query} setQuery={setQuery} onCreate={() => void create()} onSelect={chooseNote} onDelete={note => { if (note.id === noteId && !canLeaveEditor()) return; void act(() => updateNote(account.id, note.id, { deletedAt: new Date().toISOString() }), '已移入回收站') }} onRestore={note => void act(() => updateNote(account.id, note.id, { deletedAt: null }), '已恢复')} onPin={note => { if (note.id === noteId && !canLeaveEditor()) return; void act(() => updateNote(account.id, note.id, { isPinned: !note.isPinned })) }} />}
+        <button type="button" className={`folder-item system-folder sidebar-trash ${folderId === trashId ? 'active' : ''}`} onClick={() => selectFolder(trashId)}><Trash2 size={14} /><span className="folder-item-name">回收站</span></button>
       </aside>
-      {isMobile && mobileView === 'list' && <div className="mobile-note-list-container"><NoteList notes={visibleNotes} folders={activeFolders} currentNoteId={noteId} rejectedIds={rejectedIds} label={query ? '搜索结果' : selectedFolderName} isTrash={folderId === trashId} query={query} setQuery={setQuery} onCreate={() => void create()} onSelect={chooseNote} onDelete={note => { if (note.id === noteId && !canLeaveEditor()) return; void act(() => updateNote(account.id, note.id, { deletedAt: new Date().toISOString() }), '已移入回收站') }} onRestore={note => void act(() => updateNote(account.id, note.id, { deletedAt: null }), '已恢复')} onPin={note => { if (note.id === noteId && !canLeaveEditor()) return; void act(() => updateNote(account.id, note.id, { isPinned: !note.isPinned })) }} onMove={(note, destination) => { if (note.id === noteId && !canLeaveEditor()) return; void act(() => updateNote(account.id, note.id, { folderId: destination }), '已移动') }} /></div>}
-      {(!isMobile || mobileView === 'editor' || sessionEnded) && <main className={`app-editor ${isMobile ? 'mobile-active' : ''}`}>{creatingNote ? <div className="editor-empty">正在新建便签…</div> : currentNote ? <Suspense fallback={<div className="editor-empty">加载编辑器…</div>}><NoteEditor note={currentNote} onEdit={editNote} onSaveCopy={saveCopy} onDiscardError={() => { setUnresolvedEditorDraft(false); setLocalError(null) }} onCreate={() => { if (!sessionEnded) void create() }} onOpenConflicts={() => { if (!sessionEnded) setDataPanelOpen(true) }} localError={localError?.noteId === currentNote.id ? localError.message : null} syncError={syncError} pendingCount={pendingCount} hasConflict={currentNoteHasConflict} isMobile={isMobile} theme={theme} onToggleTheme={() => setTheme(current => current === 'light' ? 'dark' : 'light')} /></Suspense> : <div className="editor-empty"><div className="editor-empty-content"><p>选择或创建一个便签开始编辑</p></div></div>}</main>}
+      {isMobile && mobileView === 'list' && <div className="mobile-note-list-container"><NoteList notes={visibleNotes} currentNoteId={noteId} rejectedIds={rejectedIds} label={query ? '搜索结果' : selectedFolderName} isTrash={folderId === trashId} query={query} setQuery={setQuery} onCreate={() => void create()} onSelect={chooseNote} onDelete={note => { if (note.id === noteId && !canLeaveEditor()) return; void act(() => updateNote(account.id, note.id, { deletedAt: new Date().toISOString() }), '已移入回收站') }} onRestore={note => void act(() => updateNote(account.id, note.id, { deletedAt: null }), '已恢复')} onPin={note => { if (note.id === noteId && !canLeaveEditor()) return; void act(() => updateNote(account.id, note.id, { isPinned: !note.isPinned })) }} /></div>}
+      {(!isMobile || mobileView === 'editor' || sessionEnded) && <main className={`app-editor ${isMobile ? 'mobile-active' : ''}`}>{creatingNote ? <div className="editor-empty">正在新建便签…</div> : currentNote ? <Suspense fallback={<div className="editor-empty">加载编辑器…</div>}><NoteEditor note={currentNote} folders={activeFolders} onEdit={editNote} onSaveCopy={saveCopy} onDiscardError={() => { setUnresolvedEditorDraft(false); setLocalError(null) }} onCreate={() => { if (!sessionEnded) void create() }} onMoveFolder={destination => { if (!canLeaveEditor()) return; void act(() => updateNote(account.id, currentNote.id, { folderId: destination }), '已移动') }} onOpenSidebar={!isMobile && !desktopSidebarOpen ? () => setDesktopSidebarOpen(true) : undefined} onOpenConflicts={() => { if (!sessionEnded) setDataPanelOpen(true) }} localError={localError?.noteId === currentNote.id ? localError.message : null} syncError={syncError} pendingCount={pendingCount} syncIssueCount={conflicts.length + rejectedCount} hasConflict={currentNoteHasConflict} isMobile={isMobile} theme={theme} onToggleTheme={() => setTheme(current => current === 'light' ? 'dark' : 'light')} /></Suspense> : <div className="editor-empty"><div className="empty-editor-toolbar">{!isMobile && !desktopSidebarOpen && <button type="button" className="toolbar-btn" title="展开侧栏" aria-label="展开侧栏" onClick={() => setDesktopSidebarOpen(true)}><PanelLeftOpen size={18} /></button>}<div className="toolbar-spacer" /><button type="button" className="sync-status-button" title="打开数据与同步" onClick={() => setDataPanelOpen(true)}><Database size={15} /><span>数据与同步</span>{conflicts.length + rejectedCount > 0 && <span className="sync-issue-badge">{conflicts.length + rejectedCount}</span>}</button><button type="button" className="toolbar-btn" aria-label="切换主题" title="切换主题" onClick={() => setTheme(current => current === 'light' ? 'dark' : 'light')}>{theme === 'light' ? <Moon size={16} /> : <Sun size={16} />}</button></div><div className="editor-empty-content"><p>选择或创建一个便签开始编辑</p></div></div>}</main>}
     </div>
-    {dataPanelOpen && !sessionEnded && <Suspense fallback={null}><DataPanel ownerId={account.id} note={currentNote} hasUnsavedDraft={Boolean(hasUnsavedDraft)} onClose={() => setDataPanelOpen(false)} onCleared={onLogout} /></Suspense>}
+    {dataPanelOpen && !sessionEnded && <Suspense fallback={null}><DataPanel ownerId={account.id} note={currentNote} hasUnsavedDraft={Boolean(hasUnsavedDraft)} onClose={() => setDataPanelOpen(false)} onLogout={async () => { if (!canLeaveEditor()) return; setDataPanelOpen(false); await onLogout() }} onCleared={onLogout} /></Suspense>}
   </div>
 }
 
-function NoteList({ notes, folders, currentNoteId, rejectedIds, label, query, setQuery, isTrash, onCreate, onSelect, onDelete, onRestore, onPin, onMove }: {
-  notes: Note[]; folders: Folder[]; currentNoteId: string | null; rejectedIds: Set<string>; label: string; query: string; setQuery: (value: string) => void; isTrash: boolean
-  onCreate: () => void; onSelect: (note: Note) => void; onDelete: (note: Note) => void; onRestore: (note: Note) => void; onPin: (note: Note) => void; onMove: (note: Note, folderId: string | null) => void
+function NoteList({ notes, currentNoteId, rejectedIds, label, query, setQuery, isTrash, onCreate, onSelect, onDelete, onRestore, onPin }: {
+  notes: Note[]; currentNoteId: string | null; rejectedIds: Set<string>; label: string; query: string; setQuery: (value: string) => void; isTrash: boolean
+  onCreate: () => void; onSelect: (note: Note) => void; onDelete: (note: Note) => void; onRestore: (note: Note) => void; onPin: (note: Note) => void
 }) {
-  return <div className="note-list"><div className="note-list-header"><h3 className="note-list-title">{label}</h3><button type="button" className="btn-icon btn-primary" title="新建便签" onClick={onCreate}><Plus size={18} /></button></div>
-    {!isTrash && <label className="search-box"><Search size={16} /><input aria-label="搜索便签" placeholder="搜索便签" value={query} onChange={event => setQuery(event.target.value)} /></label>}
-    <div className="note-list-content">{notes.length ? notes.map(note => <div key={note.id} className={`note-item ${currentNoteId === note.id ? 'active' : ''} ${note.isPinned ? 'pinned' : ''}`} onClick={() => onSelect(note)}>
-      <div className="note-item-header"><h4 className="note-item-title">{note.title || '无标题'}</h4><div className="note-item-actions">{isTrash ? <button type="button" className="btn-icon-sm" title="恢复" onClick={event => { event.stopPropagation(); onRestore(note) }}><Check size={14} /></button> : <><select className="note-folder-select" title="移动到文件夹" aria-label={`移动便签 ${note.title || '无标题'} 到文件夹`} value={note.folderId ?? ''} onClick={event => event.stopPropagation()} onChange={event => { event.stopPropagation(); onMove(note, event.target.value || null) }}><option value="">未分类</option>{folders.map(folder => <option key={folder.id} value={folder.id}>{folder.name}</option>)}</select><button type="button" className="btn-icon-sm" title={note.isPinned ? '取消置顶' : '置顶'} onClick={event => { event.stopPropagation(); onPin(note) }}><Pin size={14} /></button><button type="button" className="btn-icon-sm danger" title="移入回收站" onClick={event => { event.stopPropagation(); if (confirm('将这条便签移入回收站？')) onDelete(note) }}><Trash2 size={14} /></button></>}</div></div>
+  const [searchOpen, setSearchOpen] = useState(Boolean(query))
+  const closeSearch = () => { setQuery(''); setSearchOpen(false) }
+  return <div className="note-list"><div className="note-list-header"><div className="note-list-heading"><h3 className="note-list-title" title={label}>便签</h3>{!isTrash && <button type="button" className={`btn-icon btn-ghost note-search-toggle ${searchOpen ? 'active' : ''}`} title={searchOpen ? '收起搜索' : '搜索便签'} aria-label={searchOpen ? '收起搜索' : '搜索便签'} aria-expanded={searchOpen} onClick={() => searchOpen ? closeSearch() : setSearchOpen(true)}>{searchOpen ? <X size={16} /> : <Search size={16} />}</button>}</div><button type="button" className="btn-icon btn-primary" title="新建便签" aria-label="新建便签" onClick={onCreate}><Plus size={18} /></button></div>
+    {!isTrash && searchOpen && <label className="search-box search-box-expanded"><Search size={16} /><input autoFocus aria-label="搜索便签" placeholder="搜索便签" value={query} onChange={event => setQuery(event.target.value)} onKeyDown={event => { if (event.key === 'Escape') closeSearch() }} /></label>}
+    <div className="note-list-content" role="listbox" aria-label={label}>{notes.length ? notes.map(note => <div key={note.id} role="option" aria-selected={currentNoteId === note.id} tabIndex={0} className={`note-item ${currentNoteId === note.id ? 'active' : ''} ${note.isPinned ? 'pinned' : ''}`} onClick={() => onSelect(note)} onKeyDown={event => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); onSelect(note) } }}>
+      <div className="note-item-header"><h4 className="note-item-title">{note.title || '无标题'}</h4><div className="note-item-actions">{isTrash ? <button type="button" className="btn-icon-sm" title="恢复" onClick={event => { event.stopPropagation(); onRestore(note) }}><Check size={14} /></button> : <><button type="button" className="btn-icon-sm" title={note.isPinned ? '取消置顶' : '置顶'} onClick={event => { event.stopPropagation(); onPin(note) }}><Pin size={14} /></button><button type="button" className="btn-icon-sm danger" title="移入回收站" onClick={event => { event.stopPropagation(); if (confirm('将这条便签移入回收站？')) onDelete(note) }}><Trash2 size={14} /></button></>}</div></div>
       <p className="note-item-summary">{note.plainText.slice(0, 80) || '无内容'}</p><div className="note-item-footer"><span className="note-item-date">{formatDate(note.updatedAt)}</span>{rejectedIds.has(note.id) && !isTrash && <span className="note-item-badge">需处理</span>}{note.isPinned && !isTrash && <span className="note-item-badge">置顶</span>}</div>
     </div>) : <div className="note-list-empty"><FileText size={48} className="empty-icon" /><p>{query ? '没有找到便签' : isTrash ? '回收站为空' : '暂无便签'}</p>{!isTrash && !query && <button type="button" className="btn-text" onClick={onCreate}>创建第一条便签</button>}</div>}</div>
   </div>

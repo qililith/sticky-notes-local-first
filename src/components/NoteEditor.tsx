@@ -1,31 +1,35 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { EditorContent, useEditor } from '@tiptap/react'
 import { closeHistory } from '@tiptap/pm/history'
 import { Fragment, Slice } from '@tiptap/pm/model'
 import { toast } from 'sonner'
 import { createEditorExtensions } from '../data/editorSchema'
-import { Bold, CheckSquare, Heading1, Heading2, Heading3, Highlighter, Italic, List, ListOrdered, Maximize2, Minimize2, Moon, Plus, Redo2, Sun, Undo2 } from 'lucide-react'
-import type { Note, RichText } from '../data/types'
+import { Bold, Check, CheckSquare, ChevronLeft, ChevronRight, Database, FolderInput, Heading1, Heading2, Heading3, Highlighter, Italic, List, ListOrdered, Maximize2, Minimize2, Moon, PanelLeftOpen, Plus, Redo2, Sun, Undo2 } from 'lucide-react'
+import type { Folder, Note, RichText } from '../data/types'
 import { MAX_TITLE_LENGTH, titleWithSuffix } from '../data/limits'
 import { beginEditorWrite } from '../data/saveGuard'
 
 type Props = {
   note: Note | null
+  folders: Folder[]
   onEdit: (id: string, change: { title: string; doc: RichText; plainText: string }, expectedRev: number) => Promise<Note>
   onSaveCopy: (change: { title: string; doc: RichText; plainText: string }) => Promise<void>
   onDiscardError: () => void
   onCreate: () => void
+  onMoveFolder: (folderId: string | null) => void
+  onOpenSidebar?: () => void
   onOpenConflicts: () => void
   localError: string | null
   syncError: string | null
   pendingCount: number
+  syncIssueCount: number
   hasConflict: boolean
   isMobile: boolean
   theme: string
   onToggleTheme: () => void
 }
 
-function EditorBody({ note, onEdit, onSaveCopy, onDiscardError, onCreate, onOpenConflicts, localError, syncError, pendingCount, hasConflict, isMobile, theme, onToggleTheme }: Props & { note: Note }) {
+function EditorBody({ note, folders, onEdit, onSaveCopy, onDiscardError, onCreate, onMoveFolder, onOpenSidebar, onOpenConflicts, localError, syncError, pendingCount, syncIssueCount, hasConflict, isMobile, theme, onToggleTheme }: Props & { note: Note }) {
   const [title, setTitle] = useState(note.title)
   const titleRef = useRef(note.title)
   const titleInputRef = useRef<HTMLInputElement>(null)
@@ -36,6 +40,11 @@ function EditorBody({ note, onEdit, onSaveCopy, onDiscardError, onCreate, onOpen
   const expectedRev = useRef(note.localRev)
   const [saving, setSaving] = useState(false)
   const [externalChange, setExternalChange] = useState(false)
+  const toolbarGroupRef = useRef<HTMLDivElement>(null)
+  const folderMenuRef = useRef<HTMLDetailsElement>(null)
+  const [toolbarOverflow, setToolbarOverflow] = useState(false)
+  const [toolbarShifted, setToolbarShifted] = useState(false)
+  const [folderMenuOpen, setFolderMenuOpen] = useState(false)
 
   const enqueue = useCallback((doc: RichText, plainText: string, nextTitle: string) => {
     const capturedId = note.id
@@ -107,10 +116,31 @@ function EditorBody({ note, onEdit, onSaveCopy, onDiscardError, onCreate, onOpen
 
   useEffect(() => {
     const key = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setFullscreen(false)
+      if (event.key === 'Escape') {
+        setFullscreen(false)
+        setFolderMenuOpen(false)
+      }
     }
     window.addEventListener('keydown', key)
     return () => window.removeEventListener('keydown', key)
+  }, [])
+
+  useEffect(() => {
+    const group = toolbarGroupRef.current
+    if (!group) return
+    const updateScrollState = () => {
+      setToolbarOverflow(group.scrollWidth - group.clientWidth > 2)
+      setToolbarShifted(group.scrollLeft > 8)
+    }
+    const resizeObserver = new ResizeObserver(updateScrollState)
+    resizeObserver.observe(group)
+    group.addEventListener('scroll', updateScrollState, { passive: true })
+    const frame = window.requestAnimationFrame(updateScrollState)
+    return () => {
+      window.cancelAnimationFrame(frame)
+      group.removeEventListener('scroll', updateScrollState)
+      resizeObserver.disconnect()
+    }
   }, [])
 
   const toolbar = [
@@ -126,11 +156,45 @@ function EditorBody({ note, onEdit, onSaveCopy, onDiscardError, onCreate, onOpen
     { label: '撤销', icon: Undo2, action: () => editor?.chain().focus().undo().run() },
     { label: '重做', icon: Redo2, action: () => editor?.chain().focus().redo().run() }
   ]
+  const saveStatus = localError ? '本地未保存' : externalChange ? '其它窗口已更新' : saving ? '本地保存中…' : hasConflict ? '本地已保存 · 同步冲突' : syncError ? '本地已保存 · 同步失败' : pendingCount ? `本地已保存 · 待同步 ${pendingCount}` : '本地已保存'
+  const idleSaveStatus = !localError && !externalChange && !saving && !hasConflict && !syncError && !pendingCount
+  const moveToFolder = (folderId: string | null) => { setFolderMenuOpen(false); onMoveFolder(folderId) }
+  const toggleToolbarPage = () => {
+    const group = toolbarGroupRef.current
+    if (!group) return
+    group.scrollTo({ left: toolbarShifted ? 0 : group.scrollWidth, behavior: 'smooth' })
+  }
+  const handleToolbarKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key) || (event.target as HTMLElement).closest('.toolbar-folder-popover')) return
+    const controls = Array.from(event.currentTarget.querySelectorAll<HTMLElement>('button:not(:disabled), summary'))
+      .filter(control => control.offsetParent !== null && !control.closest('.toolbar-folder-popover'))
+    const current = controls.indexOf(event.target as HTMLElement)
+    if (current < 0 || controls.length === 0) return
+    const next = event.key === 'Home' ? 0 : event.key === 'End' ? controls.length - 1 : event.key === 'ArrowRight' ? (current + 1) % controls.length : (current - 1 + controls.length) % controls.length
+    event.preventDefault()
+    controls[next]?.focus()
+  }
+  const handleFolderMenuKeyDown = (event: ReactKeyboardEvent<HTMLDetailsElement>) => {
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      setFolderMenuOpen(false)
+      folderMenuRef.current?.querySelector<HTMLElement>('summary')?.focus()
+      return
+    }
+    if (!['ArrowDown', 'ArrowUp'].includes(event.key)) return
+    const items = Array.from(folderMenuRef.current?.querySelectorAll<HTMLButtonElement>('.toolbar-folder-popover button') ?? [])
+    if (!items.length) return
+    const current = items.indexOf(document.activeElement as HTMLButtonElement)
+    const next = event.key === 'ArrowDown' ? (current + 1) % items.length : (current - 1 + items.length) % items.length
+    event.preventDefault()
+    items[next]?.focus()
+  }
 
   return (
     <div className={`editor-container ${fullscreen ? 'fullscreen' : ''}`}>
-      <div className="editor-toolbar">
-        <div className="toolbar-group">
+      <div className="editor-toolbar" role="toolbar" aria-label="便签编辑工具" onKeyDown={handleToolbarKeyDown}>
+        {onOpenSidebar && <button type="button" className="toolbar-btn sidebar-expand-btn" title="展开侧栏" aria-label="展开侧栏" onClick={onOpenSidebar}><PanelLeftOpen size={16} /></button>}
+        <div ref={toolbarGroupRef} className={`toolbar-group ${toolbarOverflow ? 'has-overflow' : ''} ${toolbarShifted ? 'is-shifted' : ''}`} role="group" aria-label="排版工具">
           {toolbar.map(({ label, icon: Icon, action }, index) => (
             <span className="toolbar-wrapper" key={label}>
               {(index === 3 || index === 6 || index === 9) && <span className="toolbar-divider" />}
@@ -138,8 +202,9 @@ function EditorBody({ note, onEdit, onSaveCopy, onDiscardError, onCreate, onOpen
             </span>
           ))}
         </div>
+        {toolbarOverflow && <button type="button" className="toolbar-btn toolbar-scroll-next" title={toolbarShifted ? '返回前面的排版工具' : '查看更多排版工具'} aria-label={toolbarShifted ? '向左返回前面的排版工具' : '向右查看更多排版工具'} onClick={toggleToolbarPage}>{toolbarShifted ? <ChevronLeft size={16} /> : <ChevronRight size={16} />}</button>}
         <div className="toolbar-spacer" />
-        <span className={`save-status ${localError || externalChange || hasConflict || syncError ? 'unsaved' : ''}`}>{localError ? '本地未保存' : externalChange ? '其它窗口已更新' : saving ? '本地保存中…' : hasConflict ? '本地已保存 · 同步冲突' : syncError ? '本地已保存 · 同步失败' : pendingCount ? `本地已保存 · 待同步 ${pendingCount}` : '本地已保存'}</span>
+        <button type="button" className={`sync-status-button ${localError || externalChange || hasConflict || syncError ? 'unsaved' : ''} ${idleSaveStatus ? 'is-idle' : ''}`} title="打开数据与同步" onClick={onOpenConflicts}><Database size={15} /><span className="sync-status-label">{saveStatus}</span>{syncIssueCount > 0 && <span className="sync-issue-badge" aria-label={`${syncIssueCount} 项需要处理`}>{syncIssueCount}</span>}</button>
         {hasConflict && <button type="button" className="toolbar-btn recovery-btn" onClick={onOpenConflicts}>处理冲突</button>}
         {syncError && !hasConflict && <button type="button" className="toolbar-btn recovery-btn" onClick={onOpenConflicts}>查看同步问题</button>}
         {(localError || externalChange) && <button type="button" className="toolbar-btn recovery-btn" onClick={() => {
@@ -161,12 +226,13 @@ function EditorBody({ note, onEdit, onSaveCopy, onDiscardError, onCreate, onOpen
           setExternalChange(false)
           onDiscardError()
         }}>加载新版本</button>}
+        <details ref={folderMenuRef} className="toolbar-folder-menu" open={folderMenuOpen} onToggle={event => setFolderMenuOpen(event.currentTarget.open)} onKeyDown={handleFolderMenuKeyDown}><summary className="toolbar-btn" title="移动到文件夹" aria-label="移动当前便签到文件夹" aria-haspopup="menu" aria-expanded={folderMenuOpen}><FolderInput size={16} /></summary><div className="toolbar-folder-popover" role="menu" aria-label="选择目标文件夹"><p>移动到文件夹</p><button type="button" role="menuitemradio" aria-checked={note.folderId === null} className={note.folderId === null ? 'active' : ''} onClick={() => moveToFolder(null)}><span>未分类</span>{note.folderId === null && <Check size={14} />}</button>{folders.map(folder => <button type="button" role="menuitemradio" aria-checked={note.folderId === folder.id} className={note.folderId === folder.id ? 'active' : ''} key={folder.id} onClick={() => moveToFolder(folder.id)}><span>{folder.name}</span>{note.folderId === folder.id && <Check size={14} />}</button>)}</div></details>
         <span className="word-count">{wordCount} 字</span>
-        <button type="button" className="toolbar-btn fullscreen-btn" title={fullscreen ? '退出全屏' : '全屏编辑'} onClick={() => setFullscreen(!fullscreen)}>
-          {fullscreen ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
-        </button>
         <button type="button" className="toolbar-btn editor-theme-toggle" aria-label="切换主题" title="切换主题" onClick={onToggleTheme}>
           {theme === 'light' ? <Moon size={16} /> : <Sun size={16} />}
+        </button>
+        <button type="button" className="toolbar-btn fullscreen-btn" title={fullscreen ? '退出全屏' : '全屏编辑'} onClick={() => setFullscreen(!fullscreen)}>
+          {fullscreen ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
         </button>
       </div>
       <div className="editor-body">

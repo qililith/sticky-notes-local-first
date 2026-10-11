@@ -50,28 +50,28 @@ it('does not reopen a locally locked account from a leftover SDK session', async
   act(() => emit('SIGNED_IN', { user: { id: 'account-a', email: 'a@example.test' } }))
   act(() => window.dispatchEvent(new Event('focus')))
   expect(getUser).not.toHaveBeenCalled()
-  expect(screen.queryByRole('button', { name: '退出登录' })).toBeNull()
+  expect(screen.queryByRole('button', { name: '数据与同步' })).toBeNull()
 })
 
 it('locks on another tab removing the account hint, even without an SDK sign-out event', async () => {
   let finishVerification!: (result: AuthResult) => void
   getUser.mockImplementationOnce(() => new Promise(resolve => { finishVerification = resolve }))
   render(<App />)
-  await screen.findByRole('button', { name: '退出登录' })
+  await screen.findByRole('button', { name: '数据与同步' })
   act(() => {
     remembered.account = null
     window.dispatchEvent(new StorageEvent('storage', { key: 'sticky-notes-last-account', newValue: null }))
   })
   await screen.findByRole('heading', { name: '欢迎使用' })
   await act(async () => finishVerification({ data: { user: { id: 'account-a', email: 'a@example.test' } }, error: null }))
-  expect(screen.queryByRole('button', { name: '退出登录' })).toBeNull()
+  expect(screen.queryByRole('button', { name: '数据与同步' })).toBeNull()
 })
 
 it('opens remembered local data without waiting for a slow online auth service', async () => {
   remembered.account = { id: 'account-a', email: 'a@example.test' }
   getUser.mockImplementationOnce(() => new Promise(() => {}))
   render(<App />)
-  await screen.findByRole('button', { name: '退出登录' })
+  await screen.findByRole('button', { name: '数据与同步' })
   expect(screen.queryByText('加载中…')).toBeNull()
 })
 
@@ -83,7 +83,7 @@ it.each([
   remembered.account = { id: 'account-a', email: 'a@example.test' }
   getUser.mockResolvedValueOnce({ data: { user: null }, error })
   render(<App />)
-  await screen.findByRole('button', { name: '退出登录' })
+  await screen.findByRole('button', { name: '数据与同步' })
   expect(screen.queryByRole('heading', { name: '欢迎使用' })).toBeNull()
 })
 
@@ -91,7 +91,7 @@ it('continues listening for sign-out when the remembered workspace starts offlin
   remembered.account = { id: 'account-a', email: 'a@example.test' }
   Object.defineProperty(navigator, 'onLine', { configurable: true, value: false })
   render(<App />)
-  await screen.findByRole('button', { name: '退出登录' })
+  await screen.findByRole('button', { name: '数据与同步' })
   act(() => emit('SIGNED_OUT'))
   await screen.findByRole('heading', { name: '欢迎使用' })
 })
@@ -101,7 +101,7 @@ it('rechecks an offline-started account on reconnection and locks a missing sess
   Object.defineProperty(navigator, 'onLine', { configurable: true, value: false })
   getUser.mockResolvedValueOnce({ data: { user: null }, error: { name: 'AuthSessionMissingError', status: 400 } })
   render(<App />)
-  await screen.findByRole('button', { name: '退出登录' })
+  await screen.findByRole('button', { name: '数据与同步' })
   expect(getUser).not.toHaveBeenCalled()
   Object.defineProperty(navigator, 'onLine', { configurable: true, value: true })
   act(() => window.dispatchEvent(new Event('online')))
@@ -113,7 +113,7 @@ it('retries a temporary auth failure on focus without reloading local data', asy
   remembered.account = { id: 'account-a', email: 'a@example.test' }
   getUser.mockResolvedValueOnce({ data: { user: null }, error: { name: 'AuthRetryableFetchError', status: 0 } })
   render(<App />)
-  await screen.findByRole('button', { name: '退出登录' })
+  await screen.findByRole('button', { name: '数据与同步' })
   getUser.mockResolvedValueOnce({ data: { user: null }, error: { name: 'AuthApiError', status: 403 } })
   act(() => window.dispatchEvent(new Event('focus')))
   await screen.findByRole('heading', { name: '欢迎使用' })
@@ -122,12 +122,12 @@ it('retries a temporary auth failure on focus without reloading local data', asy
 
 it('does not automatically reopen a signed-out account on focus or reconnection', async () => {
   render(<App />)
-  await screen.findByRole('button', { name: '退出登录' })
+  await screen.findByRole('button', { name: '数据与同步' })
   act(() => emit('SIGNED_OUT'))
   await screen.findByRole('heading', { name: '欢迎使用' })
   act(() => { window.dispatchEvent(new Event('focus')); window.dispatchEvent(new Event('online')) })
   expect(getUser).toHaveBeenCalledTimes(1)
-  expect(screen.queryByRole('button', { name: '退出登录' })).toBeNull()
+  expect(screen.queryByRole('button', { name: '数据与同步' })).toBeNull()
 })
 
 it('preserves a pending editor when background auth explicitly rejects the account', async () => {
@@ -135,7 +135,7 @@ it('preserves a pending editor when background auth explicitly rejects the accou
   let finishVerification!: (result: AuthResult) => void
   getUser.mockImplementationOnce(() => new Promise(resolve => { finishVerification = resolve }))
   render(<App />)
-  await screen.findByRole('button', { name: '退出登录' })
+  await screen.findByRole('button', { name: '数据与同步' })
   const finishWrite = beginEditorWrite()
   try {
     await act(async () => finishVerification({ data: { user: null }, error: { name: 'AuthApiError', status: 403 } }))
@@ -151,7 +151,7 @@ it('does not let a different background-verified account replace a pending edito
   let finishVerification!: (result: AuthResult) => void
   getUser.mockImplementationOnce(() => new Promise(resolve => { finishVerification = resolve }))
   render(<App />)
-  await screen.findByRole('button', { name: '退出登录' })
+  await screen.findByRole('button', { name: '数据与同步' })
   const finishWrite = beginEditorWrite()
   try {
     await act(async () => finishVerification({ data: { user: { id: 'account-b', email: 'b@example.test' } }, error: null }))
@@ -162,21 +162,21 @@ it('does not let a different background-verified account replace a pending edito
 
 it('locks the local workspace immediately when sign-out has no unsaved write', async () => {
   render(<App />)
-  await screen.findByRole('button', { name: '退出登录' })
+  await screen.findByRole('button', { name: '数据与同步' })
   act(() => emit('SIGNED_OUT'))
   await screen.findByRole('heading', { name: '欢迎使用' })
 })
 
 it('locks another tab after this account is cleared elsewhere', async () => {
   render(<App />)
-  await screen.findByRole('button', { name: '退出登录' })
+  await screen.findByRole('button', { name: '数据与同步' })
   act(() => window.dispatchEvent(new StorageEvent('storage', { key: accountClearedEventKey('account-a'), newValue: 'cleared' })))
   await screen.findByRole('heading', { name: '欢迎使用' })
 })
 
 it('keeps the current editor mounted until an in-flight write settles', async () => {
   render(<App />)
-  await screen.findByRole('button', { name: '退出登录' })
+  await screen.findByRole('button', { name: '数据与同步' })
   const finish = beginEditorWrite()
   try {
     act(() => emit('SIGNED_OUT'))
@@ -190,7 +190,7 @@ it('keeps the current editor mounted until an in-flight write settles', async ()
 
 it('keeps a failed draft available after sign-out until it is resolved', async () => {
   render(<App />)
-  await screen.findByRole('button', { name: '退出登录' })
+  await screen.findByRole('button', { name: '数据与同步' })
   act(() => setUnresolvedEditorDraft(true))
   act(() => emit('SIGNED_OUT'))
   expect(screen.getByRole('alert').textContent).toContain('当前账号已退出或切换')
@@ -201,7 +201,7 @@ it('keeps a failed draft available after sign-out until it is resolved', async (
 
 it('does not lock when an in-flight write fails after sign-out', async () => {
   render(<App />)
-  await screen.findByRole('button', { name: '退出登录' })
+  await screen.findByRole('button', { name: '数据与同步' })
   const finish = beginEditorWrite()
   act(() => emit('SIGNED_OUT'))
   act(() => setUnresolvedEditorDraft(true))
@@ -220,12 +220,12 @@ it('does not restore a stale user after a newer sign-out event', async () => {
   act(() => emit('SIGNED_OUT'))
   await screen.findByRole('heading', { name: '欢迎使用' })
   await act(async () => { finishGetUser?.({ data: { user: { id: 'account-a', email: 'a@example.test' } }, error: null }) })
-  expect(screen.queryByRole('button', { name: '退出登录' })).toBeNull()
+  expect(screen.queryByRole('button', { name: '数据与同步' })).toBeNull()
 })
 
 it('does not replace an in-flight editor with a different account', async () => {
   render(<App />)
-  await screen.findByRole('button', { name: '退出登录' })
+  await screen.findByRole('button', { name: '数据与同步' })
   const finish = beginEditorWrite()
   try {
     act(() => emit('SIGNED_IN', { user: { id: 'account-b', email: 'b@example.test' } }))

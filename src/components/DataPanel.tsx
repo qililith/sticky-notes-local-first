@@ -9,9 +9,9 @@ import { hasPendingEditorWrites, hasUnresolvedEditorDraft } from '../data/saveGu
 import type { Note } from '../data/types'
 import { resolveConflict, syncOnce } from '../sync/engine'
 
-type Props = { ownerId: string; note: Note | null; hasUnsavedDraft: boolean; onClose: () => void; onCleared: () => Promise<void> }
+type Props = { ownerId: string; note: Note | null; hasUnsavedDraft: boolean; onClose: () => void; onLogout: () => Promise<void>; onCleared: () => Promise<void> }
 
-export function DataPanel({ ownerId, note, hasUnsavedDraft, onClose, onCleared }: Props) {
+export function DataPanel({ ownerId, note, hasUnsavedDraft, onClose, onLogout, onCleared }: Props) {
   const [preview, setPreview] = useState<BackupArchive | null>(null)
   const fileReadId = useRef(0)
   const [busy, setBusy] = useState(false)
@@ -127,6 +127,7 @@ export function DataPanel({ ownerId, note, hasUnsavedDraft, onClose, onCleared }
           if (confirm('确认已检查备份文件，并清除此账号在这台设备上的便签、文件夹和本地历史，然后退出登录？')) void run(async () => { await clearAccountFromDevice(ownerId); await onCleared() }, '本机账号数据已清除')
         }}>清除本机数据并退出</button>
       </section>
+      <section><h3>账户</h3><button type="button" disabled={busy || hasUnsavedDraft} onClick={() => void onLogout()}>退出登录</button></section>
     </section>
   </div>
 }
