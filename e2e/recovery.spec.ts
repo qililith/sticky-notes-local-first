@@ -33,7 +33,7 @@ test('same-account UI backup recovery keeps the original note ID', async ({ page
 
   await page.getByRole('button', { name: '数据与同步' }).click()
   const downloadPromise = page.waitForEvent('download')
-  await page.getByRole('button', { name: '导出 JSON 备份' }).click()
+  await page.getByRole('button', { name: '导出备份' }).click()
   const backupPath = await (await downloadPromise).path()
   expect(backupPath).toBeTruthy()
   page.once('dialog', dialog => void dialog.accept())

@@ -16,28 +16,47 @@ export type BackupArchive = {
   history: Revision[]
 }
 
-export async function makeBackup(ownerId: string): Promise<BackupArchive> {
+export type BackupOptions = { includeHistory?: boolean }
+
+export const MAX_BACKUP_BYTES = 100_000_000
+export const OVERSIZE_BACKUP_MESSAGE = '备份文件太大，没法用。请改用「只导出当前内容」。'
+
+export function backupByteLength(text: string): number {
+  return new TextEncoder().encode(text).byteLength
+}
+
+export function serializeBackup(archive: BackupArchive): string {
+  return JSON.stringify(archive)
+}
+
+export function assertBackupSize(text: string, limit = MAX_BACKUP_BYTES): void {
+  if (backupByteLength(text) > limit) throw new Error(OVERSIZE_BACKUP_MESSAGE)
+}
+
+export async function makeBackup(ownerId: string, options: BackupOptions = {}): Promise<BackupArchive> {
   return db.transaction('r', db.notes, db.folders, db.outbox, db.conflicts, db.history, async () => {
     const [notes, folders, pending, conflicts, history] = await Promise.all([
       db.notes.where('ownerId').equals(ownerId).toArray(),
       db.folders.where('ownerId').equals(ownerId).toArray(),
       db.outbox.where('ownerId').equals(ownerId).toArray(),
       db.conflicts.where('ownerId').equals(ownerId).toArray(),
-      db.history.where('ownerId').equals(ownerId).toArray()
+      options.includeHistory === false ? Promise.resolve([]) : db.history.where('ownerId').equals(ownerId).toArray()
     ])
     return { schema: 1 as const, exportedAt: new Date().toISOString(), sourceAccount: ownerId, notes, folders, pending, conflicts, history }
   })
 }
 
-export async function downloadBackup(ownerId: string): Promise<BackupArchive> {
+export async function downloadBackup(ownerId: string, options: BackupOptions = {}): Promise<BackupArchive> {
   if (hasPendingEditorWrites()) throw new Error('本地仍在保存，请稍等再导出备份')
   if (hasUnresolvedEditorDraft()) throw new Error('当前草稿尚未保存，备份无法包含这部分内容')
-  const archive = await makeBackup(ownerId)
-  const blob = new Blob([JSON.stringify(archive, null, 2)], { type: 'application/json' })
+  const archive = await makeBackup(ownerId, options)
+  const text = serializeBackup(archive)
+  assertBackupSize(text)
+  const blob = new Blob([text], { type: 'application/json' })
   const url = URL.createObjectURL(blob)
   const link = document.createElement('a')
   link.href = url
-  link.download = `便签备份-${new Date().toISOString().slice(0, 10)}.json`
+  link.download = `${options.includeHistory === false ? '便签当前数据' : '便签备份'}-${new Date().toISOString().slice(0, 10)}.json`
   document.body.append(link)
   link.click()
   link.remove()
@@ -46,7 +65,7 @@ export async function downloadBackup(ownerId: string): Promise<BackupArchive> {
 }
 
 export function parseBackup(text: string): BackupArchive {
-  if (text.length > 100_000_000) throw new Error('备份文件过大，请分批处理')
+  assertBackupSize(text)
   let value: unknown
   try { value = JSON.parse(text) } catch { throw new Error('文件不是有效的 JSON') }
   return validateBackup(value)

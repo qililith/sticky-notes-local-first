@@ -22,8 +22,7 @@ test('an unresolved conflict is visible from the note and app header', async ({ 
   await expect(page.locator('.save-status')).toContainText('本地已保存 · 同步冲突')
   await page.getByRole('button', { name: '处理冲突' }).click()
   const panel = page.getByRole('dialog', { name: '数据与同步' })
-  await expect(panel).toContainText('另一台设备也改动了这项')
-  await panel.getByText('查看本机版本').click()
+  await expect(panel).toContainText('这台设备和另一台设备都改过')
+  await panel.getByText('这台设备上的内容').click()
   await expect(panel.locator('pre').first()).toContainText('冲突后新增')
 })
-

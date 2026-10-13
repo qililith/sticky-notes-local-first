@@ -16,7 +16,7 @@ test('folder repair names the rejected note and preserves its content', async ({
   const panel = page.getByRole('dialog', { name: '数据与同步' })
   await expect(panel).toContainText('便签：真正被拒绝的便签')
   await panel.getByRole('button', { name: '移到未分类并重试' }).click()
-  await expect(panel).toContainText('需处理 0 项')
+  await expect(panel.getByRole('button', { name: '移到未分类并重试' })).toHaveCount(0)
   const result = await page.evaluate(async () => {
     const { db } = await import('/src/data/db.ts')
     const notes = await db.notes.toArray()
@@ -71,6 +71,6 @@ test('a cloud-rejected note is listed for repair without counting as pending upl
   await expect(page.locator('.note-item-badge')).toHaveText('需处理')
   await page.getByRole('button', { name: '查看同步问题' }).click()
   const panel = page.getByRole('dialog', { name: '数据与同步' })
-  await expect(panel).toContainText('待同步 0 项 · 需处理 1 项')
+  await expect(panel).toContainText('有 1 条内容没能同步')
   await expect(panel).toContainText('超过云端单次上传限制')
 })

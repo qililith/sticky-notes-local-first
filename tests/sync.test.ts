@@ -425,15 +425,17 @@ describe('sync sequencing', () => {
 
   it('rejects a conflict response for a different account without discarding local work', async () => {
     const note = await createNote('account-a', null)
-    rpc.mockResolvedValue({ data: { status: 'conflict', record: {
-      id: note.id, owner_id: 'account-b', title: '不应接收', doc: emptyDocument,
-      doc_version: 1, plain_text: '', folder_id: null, is_pinned: false,
-      created_at: note.createdAt, updated_at: note.updatedAt, deleted_at: null, version: 1
-    } }, error: null })
-    expect(await syncOnce('account-a')).toBe(false)
+    rpc.mockImplementation(async (name: string) => name === 'pull_changes'
+      ? { data: { items: [], next: '0' }, error: null }
+      : { data: { status: 'conflict', record: {
+        id: note.id, owner_id: 'account-b', title: '不应接收', doc: emptyDocument,
+        doc_version: 1, plain_text: '', folder_id: null, is_pinned: false,
+        created_at: note.createdAt, updated_at: note.updatedAt, deleted_at: null, version: 1
+      } }, error: null })
+    expect(await syncOnce('account-a')).toBe(true)
     expect(await db.conflicts.where('ownerId').equals('account-a').count()).toBe(0)
-    expect(await db.outbox.where('ownerId').equals('account-a').count()).toBe(1)
-    expect((await db.syncMeta.get('account-a'))?.lastError).toContain('不匹配的冲突记录')
+    expect(await db.outbox.where('ownerId').equals('account-a').first()).toMatchObject({ state: 'rejected', error: expect.stringContaining('不匹配的冲突记录') })
+    expect((await db.syncMeta.get('account-a'))?.lastError).toContain('1 项被云端拒绝')
   })
 
   it('accepts an identical remote record without making a false conflict', async () => {
@@ -498,6 +500,30 @@ describe('sync sequencing', () => {
     expect(await db.outbox.where('entityId').equals(healthyNote.id).count()).toBe(0)
     expect((await db.notes.get(remoteId))?.plainText).toBe('云端新便签')
     expect(await db.notes.get(rejectedNote.id)).toMatchObject({ serverVersion: 0, localRev: rejectedNote.localRev })
+    expect((await db.syncMeta.get('account-a'))?.lastError).toContain('1 项被云端拒绝')
+  })
+
+  it('isolates an unclassified upload failure so later notes and pull still run', async () => {
+    const broken = await createNote('account-a', null)
+    const healthy = await createNote('account-a', null)
+    const brokenMutation = (await db.outbox.where('entityId').equals(broken.id).first())!
+    await db.outbox.update(brokenMutation.id, { createdAt: '2000-01-01T00:00:00.000Z' })
+    const calls: string[] = []
+    rpc.mockImplementation(async (name: string, args: Record<string, unknown>) => {
+      calls.push(name === 'pull_changes' ? 'pull' : String(args.p_entity_id))
+      if (name === 'pull_changes') return { data: { items: [], next: '0' }, error: null }
+      if (args.p_entity_id === broken.id) {
+        return { data: { status: 'ok', record: { id: '00000000-0000-4000-8000-000000000000', owner_id: 'account-a', version: 1 } }, error: null }
+      }
+      return { data: { status: 'ok', record: {
+        id: healthy.id, owner_id: 'account-a', title: '', doc: emptyDocument, doc_version: 1, plain_text: '',
+        folder_id: null, is_pinned: false, created_at: healthy.createdAt, updated_at: healthy.updatedAt, deleted_at: null, version: 1
+      } }, error: null }
+    })
+    expect(await syncOnce('account-a')).toBe(true)
+    expect(calls).toEqual([broken.id, healthy.id, 'pull'])
+    expect(await db.outbox.get(brokenMutation.id)).toMatchObject({ state: 'rejected', error: expect.stringContaining('不匹配的记录') })
+    expect(await db.outbox.where('entityId').equals(healthy.id).count()).toBe(0)
     expect((await db.syncMeta.get('account-a'))?.lastError).toContain('1 项被云端拒绝')
   })
 

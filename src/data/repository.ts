@@ -2,6 +2,7 @@ import { db } from './db'
 import { isAccountSyncPaused, notifyAccountCleared, pauseAccountSync, resumeAccountSync, withAccountSyncLock } from './accountSyncGate'
 import { checkedFolderName, checkedTitle } from './limits'
 import { hasPendingEditorWrites, hasUnresolvedEditorDraft } from './saveGuard'
+import { recordPersistence } from './storageUsage'
 import { emptyDocument, folderPayload, notePayload, type Entity, type Folder, type Mutation, type Note, type RichText } from './types'
 
 const now = () => new Date().toISOString()
@@ -9,9 +10,9 @@ const id = () => crypto.randomUUID()
 let persistenceRequested = false
 
 function requestPersistentStorage() {
-  if (persistenceRequested || typeof navigator === 'undefined' || !navigator.storage?.persist) return
+  if (persistenceRequested || typeof navigator === 'undefined') return
   persistenceRequested = true
-  void navigator.storage.persist().catch(() => undefined)
+  void recordPersistence()
 }
 
 function requireOwner(ownerId: string) {

@@ -126,6 +126,15 @@ function isPermanentRejection(cause: unknown): boolean {
   return /Mutation too large|Folder does not belong to account|Invalid note|Invalid folder|Invalid mutation|不受支持/i.test(detail)
 }
 
+function isTransientSyncFailure(cause: unknown): boolean {
+  const error = cause as { status?: number; message?: string }
+  if (error?.status === 401 || error?.status === 403) return true
+  if (error?.status && error.status >= 500) return true
+  const detail = error?.message ?? ''
+  if (/fetch|network|timeout/i.test(detail)) return true
+  return typeof navigator !== 'undefined' && !navigator.onLine
+}
+
 async function rewriteNoteWithoutFolder(ownerId: string, mutation: Mutation): Promise<Mutation | null> {
   return db.transaction('rw', db.notes, db.outbox, db.conflicts, async () => {
     const current = await db.outbox.get(mutation.id)
@@ -400,7 +409,15 @@ export async function syncOnce(ownerId: string): Promise<boolean> {
       const items = await db.outbox.where('ownerId').equals(ownerId).sortBy('createdAt')
       items.sort((a, b) => a.createdAt.localeCompare(b.createdAt)
         || Number(b.entity === 'folder' && b.baseVersion === 0) - Number(a.entity === 'folder' && a.baseVersion === 0))
-      for (const item of items) if (item.state !== 'conflict' && item.state !== 'rejected') await uploadOne(ownerId, item, token)
+      for (const item of items) {
+        if (item.state === 'conflict' || item.state === 'rejected') continue
+        try {
+          await uploadOne(ownerId, item, token)
+        } catch (cause) {
+          if (isTransientSyncFailure(cause)) throw cause
+          await markRejected(ownerId, item, describeError(cause))
+        }
+      }
       await pull(ownerId, token)
       await setError(ownerId, await remainingSyncWarning(ownerId))
       return true

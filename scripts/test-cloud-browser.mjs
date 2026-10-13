@@ -132,7 +132,7 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
   async function download(page) {
     const panel = await openPanel(page)
     const downloaded = page.waitForEvent('download')
-    await panel.getByRole('button', { name: '导出 JSON 备份' }).click()
+    await panel.getByRole('button', { name: '导出备份' }).click()
     const stream = await (await downloaded).createReadStream()
     const chunks = []
     for await (const chunk of stream) chunks.push(chunk)
@@ -408,8 +408,8 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
     await sync(a2)
     await wait.poll(async () => (await rows(a2, 'conflicts')).filter(row => row.entityId === noteId).length).toBe(1)
     const conflictPanel = await openPanel(a2)
-    await conflictPanel.getByText('查看本机版本', { exact: true }).click()
-    await conflictPanel.getByText('查看云端版本', { exact: true }).click()
+    await conflictPanel.getByText('这台设备上的内容', { exact: true }).click()
+    await conflictPanel.getByText('其他设备上的内容', { exact: true }).click()
     await wait(conflictPanel.locator('pre').filter({ hasText: textTwo })).toBeVisible()
     await wait(conflictPanel.locator('pre').filter({ hasText: textOne })).toBeVisible()
     await wait(conflictPanel.getByRole('button', { name: '清除本机数据并退出' })).toBeDisabled()
@@ -420,7 +420,7 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
     pass('Conflict UI and downloaded backup retain both edits; clearing is blocked')
 
     step = 'Choose local conflict version and propagate the explicit resolution'
-    await conflictPanel.getByRole('button', { name: '保留本机版本' }).click()
+    await conflictPanel.getByRole('button', { name: '保留这台设备的' }).click()
     await wait.poll(async () => (await rows(a2, 'conflicts')).length).toBe(0)
     await wait.poll(async () => (await rows(a2, 'outbox')).length).toBe(0)
     await closePanel(a2)

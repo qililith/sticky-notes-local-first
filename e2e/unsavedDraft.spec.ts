@@ -80,10 +80,10 @@ test('a failed local save retains the draft and blocks leaving until copied', as
   })
   await page.getByRole('button', { name: '数据与同步' }).click()
   const panel = page.getByRole('dialog', { name: '数据与同步' })
-  await expect(panel.getByRole('button', { name: '导出 JSON 备份' })).toBeDisabled()
+  await expect(panel.getByRole('button', { name: '导出备份' })).toBeDisabled()
   await expect(panel.getByRole('button', { name: '清除本机数据并退出' })).toBeDisabled()
-  await expect(panel.getByRole('button', { name: '保留本机版本' })).toBeDisabled()
-  await expect(panel.getByRole('button', { name: '采用云端版本' })).toBeDisabled()
+  await expect(panel.getByRole('button', { name: '保留这台设备的' })).toBeDisabled()
+  await expect(panel.getByRole('button', { name: '采用其他设备的' })).toBeDisabled()
   await page.keyboard.press('Escape')
   await expect(panel).not.toBeVisible()
   await page.getByRole('button', { name: '另存为新便签' }).click()
@@ -171,4 +171,3 @@ test('an external update does not replace a draft whose local save failed', asyn
   await expect(title).toHaveValue('未保存的标题')
   await expect(page.getByRole('button', { name: '另存为新便签' })).toBeVisible()
 })
-
