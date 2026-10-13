@@ -1,0 +1,38 @@
+import { expect, test } from '@playwright/test'
+
+test('compact mobile view saves preference, preserves search and keeps notes accessible', async ({ page }) => {
+  await page.setViewportSize({ width: 360, height: 800 })
+  await page.goto('/')
+  await page.evaluate(async () => {
+    const { createNoteWithContent } = await import('/src/data/repository.ts')
+    const doc = (text: string) => ({ type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text }] }] })
+    for (let i = 1; i <= 8; i++) await createNoteWithContent('local-demo', null, `便签${i}`, doc(`摘要${i}`), `摘要${i}`)
+    await createNoteWithContent('local-demo', null, '', doc('没有标题时用正文辨认'), '没有标题时用正文辨认')
+  })
+  await expect(page.getByRole('option')).toHaveCount(9)
+  const cardHeight = (await page.locator('.note-item').first().boundingBox())!.height
+  await page.getByRole('button', { name: '设置', exact: true }).click()
+  await page.getByRole('radio', { name: '列表视图' }).check()
+  await page.getByRole('button', { name: '返回便签' }).click()
+  await expect(page.locator('.compact-note-list')).toBeVisible()
+  const rowHeight = (await page.locator('.note-item').first().boundingBox())!.height
+  expect(rowHeight).toBeLessThan(cardHeight * 0.65)
+  await expect(page.locator('.note-item-summary').first()).toBeHidden()
+  await expect(page.getByRole('heading', { name: '没有标题时用正文辨认' })).toBeVisible()
+  expect(await page.locator('.mobile-note-list-container').evaluate(el => el.scrollWidth > el.clientWidth)).toBe(false)
+  await page.getByRole('textbox', { name: '搜索便签' }).fill('便签5')
+  await expect(page.getByRole('option')).toHaveCount(1)
+  await page.getByRole('button', { name: '设置', exact: true }).click()
+  await page.getByRole('radio', { name: '卡片视图' }).check()
+  await page.getByRole('button', { name: '返回便签' }).click()
+  await expect(page.locator('.compact-note-list')).toHaveCount(0)
+  await expect(page.getByRole('textbox', { name: '搜索便签' })).toHaveValue('便签5')
+  await expect(page.getByRole('option')).toHaveCount(1)
+  await page.getByRole('button', { name: '设置', exact: true }).click()
+  await page.getByRole('radio', { name: '列表视图' }).check()
+  await page.reload()
+  await expect(page.locator('.compact-note-list')).toBeVisible()
+  await page.getByRole('heading', { name: '便签1', exact: true }).click()
+  await expect(page.getByRole('textbox', { name: '便签标题' })).toHaveValue('便签1')
+  await expect(page.locator('.ProseMirror')).toHaveText('摘要1')
+})

@@ -8,15 +8,18 @@ import { clearAccountFromDevice, updateNote } from '../data/repository'
 import { hasPendingEditorWrites, hasUnresolvedEditorDraft } from '../data/saveGuard'
 import type { Note } from '../data/types'
 import { resolveConflict, syncOnce } from '../sync/engine'
+import { downloadBatchExport, type BatchExportKind } from '../data/batchExport'
 
-type Props = { ownerId: string; note: Note | null; hasUnsavedDraft: boolean; onClose: () => void; onLogout: () => Promise<void>; onCleared: () => Promise<void> }
+type Props = { ownerId: string; note: Note | null; currentFolderId?: string | null; hasUnsavedDraft: boolean; onClose: () => void; onLogout: () => Promise<void>; onCleared: () => Promise<void> }
 
-export function DataPanel({ ownerId, note, hasUnsavedDraft, onClose, onLogout, onCleared }: Props) {
+export function DataPanel({ ownerId, note, currentFolderId, hasUnsavedDraft, onClose, onLogout, onCleared }: Props) {
   const [preview, setPreview] = useState<BackupArchive | null>(null)
   const fileReadId = useRef(0)
   const [busy, setBusy] = useState(false)
   const [online, setOnline] = useState(navigator.onLine)
   const [storage, setStorage] = useState<string | null>(null)
+  const [exportScope, setExportScope] = useState(currentFolderId ?? '__all__')
+  const [exportKind, setExportKind] = useState<BatchExportKind>('md-zip')
   useEffect(() => {
     const refresh = () => setOnline(navigator.onLine)
     window.addEventListener('online', refresh)
@@ -40,6 +43,9 @@ export function DataPanel({ ownerId, note, hasUnsavedDraft, onClose, onLogout, o
   const rejected = outbox.filter(item => item.state === 'rejected')
   const conflicts = useLiveQuery(() => db.conflicts.where('ownerId').equals(ownerId).toArray(), [ownerId], []) ?? []
   const history = useLiveQuery(() => note ? db.history.where('[ownerId+noteId]').equals([ownerId, note.id]).reverse().sortBy('serverVersion') : [], [ownerId, note?.id], []) ?? []
+  const folders = useLiveQuery(() => db.folders.where('ownerId').equals(ownerId).toArray(), [ownerId], []) ?? []
+  const notes = useLiveQuery(() => db.notes.where('ownerId').equals(ownerId).toArray(), [ownerId], []) ?? []
+  const exportCount = notes.filter(item => !item.deletedAt && (exportScope === '__all__' || item.folderId === (exportScope === '__unfiled__' ? null : exportScope))).length
 
   const run = async (task: () => Promise<unknown>, success: string) => {
     setBusy(true)
@@ -69,6 +75,20 @@ export function DataPanel({ ownerId, note, hasUnsavedDraft, onClose, onLogout, o
         {meta?.lastError && <p className="panel-error">同步错误：{meta.lastError}</p>}
         {storage && <p>{storage}</p>}
         <button type="button" disabled={busy || !online || !supabase} onClick={() => void run(async () => { if (!await syncOnce(ownerId)) throw new Error('同步未成功，请查看上方错误') }, '本轮同步检查已完成')}>立即重试同步</button>
+      </section>
+      <section className="batch-export-section"><h3>批量导出</h3>
+        <label>导出范围<select aria-label="导出范围" value={exportScope} disabled={busy} onChange={event => setExportScope(event.target.value)}>
+          <option value="__all__">全部便签</option><option value="__unfiled__">未分类</option>
+          {folders.filter(folder => !folder.deletedAt).sort((a, b) => a.sortOrder - b.sortOrder).map(folder => <option key={folder.id} value={folder.id}>{folder.name}</option>)}
+        </select></label>
+        <label>文件类型<select aria-label="批量导出类型" value={exportKind} disabled={busy} onChange={event => setExportKind(event.target.value as BatchExportKind)}>
+          <option value="txt-zip">TXT 文件包（ZIP）</option><option value="md-zip">Markdown 文件包（ZIP）</option><option value="html-zip">HTML 网页文件包（ZIP）</option>
+          <option value="txt-merged">合并为一个 TXT</option><option value="md-merged">合并为一个 Markdown</option>
+        </select></label>
+        <p>{exportCount} 条便签 · 使用本机已保存内容，不包含回收站。</p>
+        {hasUnsavedDraft && <p className="panel-error">当前草稿尚未保存，请先单条导出或另存为新便签。</p>}
+        <button type="button" disabled={busy || hasUnsavedDraft || exportCount === 0} onClick={() => void run(() => downloadBatchExport(ownerId,
+          exportScope === '__all__' ? { kind: 'all' } : { kind: 'folder', folderId: exportScope === '__unfiled__' ? null : exportScope }, exportKind), '批量导出下载已发起，请检查下载文件')}>开始批量导出</button>
       </section>
       <section><h3>需处理</h3>
         {rejected.length === 0 ? <p>没有被云端拒绝、需要修改后再同步的记录。</p> : rejected.map(item => <div className="panel-card" key={item.id}>

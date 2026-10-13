@@ -4,10 +4,11 @@ import { closeHistory } from '@tiptap/pm/history'
 import { Fragment, Slice } from '@tiptap/pm/model'
 import { toast } from 'sonner'
 import { createEditorExtensions } from '../data/editorSchema'
-import { Bold, Check, CheckSquare, ChevronLeft, ChevronRight, Database, FolderInput, Heading1, Heading2, Heading3, Highlighter, Italic, List, ListOrdered, Maximize2, Minimize2, Moon, PanelLeftOpen, Plus, Redo2, Sun, Undo2 } from 'lucide-react'
+import { ArrowLeft, Bold, Check, CheckSquare, ChevronDown, ChevronLeft, ChevronRight, Database, Download, FileText, FolderInput, Heading1, Heading2, Heading3, Highlighter, Italic, List, ListOrdered, Maximize2, Menu, Minimize2, Moon, PanelLeftOpen, Pin, Redo2, Sun, Trash2, Type, Undo2, X } from 'lucide-react'
 import type { Folder, Note, RichText } from '../data/types'
 import { MAX_TITLE_LENGTH, titleWithSuffix } from '../data/limits'
 import { beginEditorWrite } from '../data/saveGuard'
+import { downloadNoteExport, type NoteExportFormat } from '../data/noteExport'
 
 type Props = {
   note: Note | null
@@ -15,7 +16,6 @@ type Props = {
   onEdit: (id: string, change: { title: string; doc: RichText; plainText: string }, expectedRev: number) => Promise<Note>
   onSaveCopy: (change: { title: string; doc: RichText; plainText: string }) => Promise<void>
   onDiscardError: () => void
-  onCreate: () => void
   onMoveFolder: (folderId: string | null) => void
   onOpenSidebar?: () => void
   onOpenConflicts: () => void
@@ -27,9 +27,12 @@ type Props = {
   isMobile: boolean
   theme: string
   onToggleTheme: () => void
+  onBack?: () => void
+  onPin?: () => void
+  onDelete?: () => void
 }
 
-function EditorBody({ note, folders, onEdit, onSaveCopy, onDiscardError, onCreate, onMoveFolder, onOpenSidebar, onOpenConflicts, localError, syncError, pendingCount, syncIssueCount, hasConflict, isMobile, theme, onToggleTheme }: Props & { note: Note }) {
+function EditorBody({ note, folders, onEdit, onSaveCopy, onDiscardError, onMoveFolder, onOpenSidebar, onOpenConflicts, localError, syncError, pendingCount, syncIssueCount, hasConflict, isMobile, theme, onToggleTheme, onBack, onPin, onDelete }: Props & { note: Note }) {
   const [title, setTitle] = useState(note.title)
   const titleRef = useRef(note.title)
   const titleInputRef = useRef<HTMLInputElement>(null)
@@ -45,6 +48,11 @@ function EditorBody({ note, folders, onEdit, onSaveCopy, onDiscardError, onCreat
   const [toolbarOverflow, setToolbarOverflow] = useState(false)
   const [toolbarShifted, setToolbarShifted] = useState(false)
   const [folderMenuOpen, setFolderMenuOpen] = useState(false)
+  const [mobileEditing, setMobileEditing] = useState(false)
+  const [fontPanelOpen, setFontPanelOpen] = useState(false)
+  const [mobileMenu, setMobileMenu] = useState<'actions' | 'folders' | 'export' | null>(null)
+  const mobileMenuRef = useRef<HTMLDialogElement>(null)
+  const moreButtonRef = useRef<HTMLButtonElement>(null)
 
   const enqueue = useCallback((doc: RichText, plainText: string, nextTitle: string) => {
     const capturedId = note.id
@@ -119,11 +127,35 @@ function EditorBody({ note, folders, onEdit, onSaveCopy, onDiscardError, onCreat
       if (event.key === 'Escape') {
         setFullscreen(false)
         setFolderMenuOpen(false)
+        setFontPanelOpen(false)
+        setMobileMenu(null)
       }
     }
     window.addEventListener('keydown', key)
     return () => window.removeEventListener('keydown', key)
   }, [])
+
+  useEffect(() => {
+    if (!isMobile) return
+    const viewport = window.visualViewport
+    const resize = () => document.documentElement.style.setProperty('--mobile-viewport-height', `${viewport?.height ?? window.innerHeight}px`)
+    resize()
+    viewport?.addEventListener('resize', resize)
+    return () => {
+      viewport?.removeEventListener('resize', resize)
+      document.documentElement.style.removeProperty('--mobile-viewport-height')
+    }
+  }, [isMobile])
+
+  useEffect(() => {
+    const dialog = mobileMenuRef.current
+    if (mobileMenu && isMobile) {
+      if (dialog && !dialog.open) dialog.showModal()
+    } else if (dialog?.open) {
+      dialog.close()
+      moreButtonRef.current?.focus()
+    }
+  }, [mobileMenu, isMobile])
 
   useEffect(() => {
     const group = toolbarGroupRef.current
@@ -141,7 +173,7 @@ function EditorBody({ note, folders, onEdit, onSaveCopy, onDiscardError, onCreat
       group.removeEventListener('scroll', updateScrollState)
       resizeObserver.disconnect()
     }
-  }, [])
+  }, [isMobile])
 
   const toolbar = [
     { label: '加粗', icon: Bold, action: () => editor?.chain().focus().toggleBold().run() },
@@ -158,6 +190,15 @@ function EditorBody({ note, folders, onEdit, onSaveCopy, onDiscardError, onCreat
   ]
   const saveStatus = localError ? '本地未保存' : externalChange ? '其它窗口已更新' : saving ? '本地保存中…' : hasConflict ? '本地已保存 · 同步冲突' : syncError ? '本地已保存 · 同步失败' : pendingCount ? `本地已保存 · 待同步 ${pendingCount}` : '本地已保存'
   const idleSaveStatus = !localError && !externalChange && !saving && !hasConflict && !syncError && !pendingCount
+  const hasSaveIssue = Boolean(localError || externalChange || hasConflict || syncError || syncIssueCount)
+  const exportNote = (format: NoteExportFormat) => {
+    if (!editor) return
+    try {
+      downloadNoteExport({ title: titleRef.current, doc: editor.getJSON() as RichText }, format)
+      setMobileMenu(null)
+      toast.success('下载已发起，请检查下载文件')
+    } catch (cause) { toast.error(cause instanceof Error ? cause.message : '导出失败') }
+  }
   const moveToFolder = (folderId: string | null) => { setFolderMenuOpen(false); onMoveFolder(folderId) }
   const toggleToolbarPage = () => {
     const group = toolbarGroupRef.current
@@ -191,8 +232,14 @@ function EditorBody({ note, folders, onEdit, onSaveCopy, onDiscardError, onCreat
   }
 
   return (
-    <div className={`editor-container ${fullscreen ? 'fullscreen' : ''}`}>
-      <div className="editor-toolbar" role="toolbar" aria-label="便签编辑工具" onKeyDown={handleToolbarKeyDown}>
+    <div className={`editor-container ${fullscreen ? 'fullscreen' : ''} ${isMobile ? 'mobile-editor' : ''}`}>
+      {isMobile && <div className="mobile-editor-header">
+        <button type="button" aria-label="返回列表" onClick={onBack}><ArrowLeft size={22} /></button>
+        <div className="mobile-header-spacer" />
+        {toolbar.slice(9).map(({ label, icon: Icon, action }) => <button type="button" key={label} aria-label={label} onPointerDown={event => event.preventDefault()} onClick={action}><Icon size={21} /></button>)}
+        <button type="button" ref={moreButtonRef} aria-label="更多便签操作" aria-haspopup="dialog" aria-expanded={Boolean(mobileMenu)} onClick={() => { setFontPanelOpen(false); setMobileMenu('actions') }}><Menu size={23} />{hasSaveIssue && <span className="mobile-issue-dot" />}</button>
+      </div>}
+      {(!isMobile || localError || externalChange || hasConflict || syncError) && <div className={`editor-toolbar ${isMobile ? 'mobile-recovery-toolbar' : ''}`} role="toolbar" aria-label="便签编辑工具" onKeyDown={handleToolbarKeyDown}>
         {onOpenSidebar && <button type="button" className="toolbar-btn sidebar-expand-btn" title="展开侧栏" aria-label="展开侧栏" onClick={onOpenSidebar}><PanelLeftOpen size={16} /></button>}
         <div ref={toolbarGroupRef} className={`toolbar-group ${toolbarOverflow ? 'has-overflow' : ''} ${toolbarShifted ? 'is-shifted' : ''}`} role="group" aria-label="排版工具">
           {toolbar.map(({ label, icon: Icon, action }, index) => (
@@ -234,8 +281,12 @@ function EditorBody({ note, folders, onEdit, onSaveCopy, onDiscardError, onCreat
         <button type="button" className="toolbar-btn fullscreen-btn" title={fullscreen ? '退出全屏' : '全屏编辑'} onClick={() => setFullscreen(!fullscreen)}>
           {fullscreen ? <Minimize2 size={16} /> : <Maximize2 size={16} />}
         </button>
-      </div>
-      <div className="editor-body">
+      </div>}
+      <div className="editor-body" onFocusCapture={() => setMobileEditing(true)} onBlurCapture={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setMobileEditing(false) }}>
+        {isMobile && (!mobileEditing || hasSaveIssue) && <div className={`mobile-note-meta ${hasSaveIssue ? 'has-issue' : ''}`}>
+          <button type="button" className="mobile-sync-status" onClick={onOpenConflicts} aria-label={`数据与同步：${saveStatus}`}><Database size={14} /><span>{saveStatus}</span>{syncIssueCount > 0 && <span> · {syncIssueCount} 项需处理</span>}</button>
+          <span>{wordCount} 字</span>
+        </div>}
         <input ref={titleInputRef} className="editor-title" aria-label="便签标题" placeholder="便签标题" title={`标题最多 ${MAX_TITLE_LENGTH} 个字符`} maxLength={MAX_TITLE_LENGTH} value={title}
           onChange={event => {
             const next = event.target.value
@@ -247,7 +298,34 @@ function EditorBody({ note, folders, onEdit, onSaveCopy, onDiscardError, onCreat
         />
         <EditorContent editor={editor} className="editor-content-shell" />
       </div>
-      {isMobile && <button type="button" className="fab-btn" title="新建便签" onClick={onCreate}><Plus size={24} /></button>}
+      {isMobile && <div className="mobile-editor-tools">
+        {fontPanelOpen && <div className="mobile-font-panel" role="group" aria-label="字体设置" id="mobile-font-panel">
+          {toolbar.slice(3, 6).map(({ label, icon: Icon, action }) => <button type="button" key={label} aria-label={label} onPointerDown={event => event.preventDefault()} onClick={action}><Icon size={22} /><span>{label}</span></button>)}
+          {toolbar.slice(0, 3).map(({ label, icon: Icon, action }) => <button type="button" key={label} aria-label={label} onPointerDown={event => event.preventDefault()} onClick={action}><Icon size={22} /><span>{label}</span></button>)}
+        </div>}
+        <div className="mobile-bottom-toolbar" role="toolbar" aria-label="常用排版" onKeyDown={handleToolbarKeyDown}>
+          <button type="button" className={fontPanelOpen ? 'active' : ''} aria-label="字体" aria-expanded={fontPanelOpen} aria-controls="mobile-font-panel" onPointerDown={event => event.preventDefault()} onClick={() => setFontPanelOpen(current => !current)}><Type size={24} /></button>
+          {[toolbar[7], toolbar[6], toolbar[8]].map(({ label, icon: Icon, action }) => <button type="button" key={label} aria-label={label} onPointerDown={event => event.preventDefault()} onClick={action}><Icon size={24} /></button>)}
+          <button type="button" aria-label="收起键盘和字体面板" onClick={() => { editor?.commands.blur(); titleInputRef.current?.blur(); setMobileEditing(false); setFontPanelOpen(false) }}><ChevronDown size={24} /></button>
+        </div>
+      </div>}
+      {isMobile && <dialog ref={mobileMenuRef} className="mobile-action-sheet" aria-label={mobileMenu === 'folders' ? '移动到文件夹' : mobileMenu === 'export' ? '导出便签' : '更多便签操作'} onCancel={() => setMobileMenu(null)}>
+        <div className="mobile-sheet-heading"><h2>{mobileMenu === 'folders' ? '移动到文件夹' : mobileMenu === 'export' ? '导出便签' : '更多功能'}</h2><button type="button" aria-label="关闭操作菜单" onClick={() => setMobileMenu(null)}><X size={22} /></button></div>
+        {mobileMenu === 'export' ? <div className="mobile-sheet-items">
+          <button type="button" onClick={() => exportNote('txt')}><FileText size={20} /><span>导出 TXT</span></button>
+          <button type="button" onClick={() => exportNote('md')}><FileText size={20} /><span>导出 Markdown</span></button>
+        </div> : mobileMenu === 'folders' ? <div className="mobile-sheet-items">
+          {[{ id: null, name: '未分类' }, ...folders].map(folder => <button type="button" key={folder.id ?? 'none'} aria-pressed={note.folderId === folder.id} onClick={() => { onMoveFolder(folder.id); setMobileMenu(null) }}><FolderInput size={20} /><span>{folder.name}</span>{note.folderId === folder.id && <Check size={18} />}</button>)}
+        </div> : <div className="mobile-sheet-items">
+          <button type="button" onClick={() => { onPin?.(); setMobileMenu(null) }}><Pin size={20} /><span>{note.isPinned ? '取消置顶' : '置顶便签'}</span></button>
+          <button type="button" onClick={() => setMobileMenu('folders')}><FolderInput size={20} /><span>移动便签</span><ChevronRight size={18} /></button>
+          <button type="button" onClick={() => setMobileMenu('export')}><Download size={20} /><span>导出便签</span><ChevronRight size={18} /></button>
+          <button type="button" onClick={() => { setMobileMenu(null); onOpenConflicts() }}><Database size={20} /><span>数据与同步</span></button>
+          <button type="button" onClick={onToggleTheme}>{theme === 'light' ? <Moon size={20} /> : <Sun size={20} />}<span>切换主题</span></button>
+          <button type="button" onClick={() => { setFullscreen(current => !current); setMobileMenu(null) }}><Maximize2 size={20} /><span>{fullscreen ? '退出全屏' : '全屏编辑'}</span></button>
+          <button type="button" className="danger" onClick={() => { setMobileMenu(null); onDelete?.() }}><Trash2 size={20} /><span>移入回收站</span></button>
+        </div>}
+      </dialog>}
     </div>
   )
 }
