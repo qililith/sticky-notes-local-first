@@ -1,15 +1,17 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import Dexie from 'dexie'
 import { useLiveQuery } from 'dexie-react-hooks'
 import { toast } from 'sonner'
 import { supabase } from '../auth'
 import { downloadBackup, importBackup, MAX_BACKUP_BYTES, OVERSIZE_BACKUP_MESSAGE, parseBackup, type BackupArchive } from '../data/backup'
 import { db } from '../data/db'
-import { HISTORY_PAGE_SIZE, historyCloudTime, historyPreview, sortHistoryNewestFirst } from '../data/historyView'
-import { clearAccountFromDevice, updateNote } from '../data/repository'
+import { HISTORY_PAGE_SIZE, historyCloudTime, historyPreview } from '../data/historyView'
+import { clearAccountFromDevice, restoreNoteRevision, updateNote } from '../data/repository'
 import { hasPendingEditorWrites, hasUnresolvedEditorDraft } from '../data/saveGuard'
 import type { Note } from '../data/types'
 import { resolveConflict, syncOnce } from '../sync/engine'
 import { downloadBatchExport, type BatchExportKind } from '../data/batchExport'
+import { estimateAccountStorage, formatStorageBytes, persistenceLabel, recordPersistence, type AccountStorageEstimate } from '../data/storageUsage'
 
 type Props = { ownerId: string; note: Note | null; currentFolderId?: string | null; hasUnsavedDraft: boolean; onClose: () => void; onLogout: () => Promise<void>; onCleared: () => Promise<void> }
 
@@ -25,6 +27,7 @@ export function DataPanel({ ownerId, note, currentFolderId, hasUnsavedDraft, onC
   const [busy, setBusy] = useState(false)
   const [online, setOnline] = useState(navigator.onLine)
   const [historyPages, setHistoryPages] = useState(1)
+  const [storage, setStorage] = useState<AccountStorageEstimate | null>(null)
   const [exportScope, setExportScope] = useState(currentFolderId ?? '__all__')
   const [exportKind, setExportKind] = useState<BatchExportKind>('md-zip')
   useEffect(() => {
@@ -44,9 +47,10 @@ export function DataPanel({ ownerId, note, currentFolderId, hasUnsavedDraft, onC
   const pending = outbox.filter(item => item.state === 'pending' || item.state === 'inflight')
   const rejected = outbox.filter(item => item.state === 'rejected')
   const conflicts = useLiveQuery(() => db.conflicts.where('ownerId').equals(ownerId).toArray(), [ownerId], []) ?? []
-  const history = useLiveQuery(() => note ? db.history.where('[ownerId+noteId]').equals([ownerId, note.id]).toArray() : [], [ownerId, note?.id], []) ?? []
-  const newestHistory = useMemo(() => sortHistoryNewestFirst(history), [history])
-  const visibleHistory = newestHistory.slice(0, historyPages * HISTORY_PAGE_SIZE)
+  const historyCount = useLiveQuery(() => note ? db.history.where('[ownerId+noteId]').equals([ownerId, note.id]).count() : 0, [ownerId, note?.id])
+  const visibleHistory = useLiveQuery(() => note ? db.history.where('[ownerId+noteId+serverVersion]')
+    .between([ownerId, note.id, 0], [ownerId, note.id, Dexie.maxKey]).reverse()
+    .limit(historyPages * HISTORY_PAGE_SIZE).toArray() : [], [ownerId, note?.id, historyPages])
   const folders = useLiveQuery(() => db.folders.where('ownerId').equals(ownerId).toArray(), [ownerId], []) ?? []
   const notes = useLiveQuery(() => db.notes.where('ownerId').equals(ownerId).toArray(), [ownerId], []) ?? []
   const activeNoteCount = notes.filter(item => !item.deletedAt).length
@@ -124,17 +128,17 @@ export function DataPanel({ ownerId, note, currentFolderId, hasUnsavedDraft, onC
       </section>}
       <section>
         <h3>这条便签的以前内容</h3>
-        {!note ? <p>先打开一条便签。</p> : newestHistory.length === 0 ? <p>还没有可恢复的旧内容。</p> : <>
-          <p>从近到远排列。恢复后会生成一版新内容，现在的不会被删掉。</p>
+        {!note ? <p>先打开一条便签。</p> : historyCount === undefined || visibleHistory === undefined ? <p>正在读取旧内容…</p> : historyCount === 0 ? <p>还没有可恢复的旧内容。</p> : <>
+          <p>从近到远排列。恢复前会先把现在的内容另存为一条便签。</p>
           {visibleHistory.map(item => <div className="panel-card" key={item.id}>
             <span>{formatTime(historyCloudTime(item))}</span>
             <p className="history-preview">{historyPreview(item)}</p>
             <button type="button" disabled={busy || hasUnsavedDraft} onClick={() => {
               if (hasPendingEditorWrites() || hasUnresolvedEditorDraft()) { toast.error('请先保存或另存当前草稿'); return }
-              if (confirm('把这段旧内容恢复成现在的便签？')) void run(() => updateNote(ownerId, note.id, { title: item.snapshot.title, doc: item.snapshot.doc, plainText: item.snapshot.plainText, deletedAt: null }), '已恢复')
+              if (confirm('把这段旧内容恢复成现在的便签？当前内容会先另存为副本。')) void run(() => restoreNoteRevision(ownerId, note.id, item.id), '已恢复，原内容已另存为副本')
             }}>恢复</button>
           </div>)}
-          {visibleHistory.length < newestHistory.length && <button type="button" onClick={() => setHistoryPages(count => count + 1)}>更早的内容</button>}
+          {visibleHistory.length < historyCount && <button type="button" onClick={() => setHistoryPages(count => count + 1)}>更早的内容</button>}
         </>}
       </section>
       <section>
@@ -154,6 +158,20 @@ export function DataPanel({ ownerId, note, currentFolderId, hasUnsavedDraft, onC
           <button type="button" disabled={busy} onClick={() => void run(async () => { const result = await importBackup(ownerId, preview); setPreview(null); toast.info(`新增 ${result.notes} 条便签`) }, '导入完成')}>确认导入</button>
           <button type="button" onClick={() => setPreview(null)}>取消</button>
         </div>}
+      </section>
+      <section>
+        <h3>本机占用</h3>
+        <p>查看这台设备上保存了多少便签和旧版本。数字是估算，不能代替备份。</p>
+        <button type="button" disabled={busy} onClick={() => void run(async () => {
+          await recordPersistence()
+          setStorage(await estimateAccountStorage(ownerId))
+        }, '占用信息已更新')}>查看本机占用</button>
+        {storage && <>
+          <p>{storage.notes} 条便签（含回收站）、{storage.history} 个旧版本、{storage.outbox} 项待上传或需处理记录。</p>
+          <p>便签与文件夹约 {formatStorageBytes(storage.noteBytes)}，旧版本约 {formatStorageBytes(storage.historyBytes)}，待上传与冲突约 {formatStorageBytes(storage.queueBytes + storage.conflictBytes)}。</p>
+          {storage.siteUsageBytes !== null && <p>本网址在浏览器中共占用约 {formatStorageBytes(storage.siteUsageBytes)}{storage.siteQuotaBytes !== null ? `，浏览器报告的空间上限约 ${formatStorageBytes(storage.siteQuotaBytes)}` : ''}。</p>}
+          <p>{persistenceLabel(storage.persistence)}。请定期导出备份。</p>
+        </>}
       </section>
       <section>
         <h3>导出为文件</h3>
