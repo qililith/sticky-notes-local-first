@@ -117,22 +117,14 @@ async function markRejected(ownerId: string, mutation: Mutation, message: string
   })
 }
 
-function isPermanentRejection(cause: unknown): boolean {
+function isPermanentRejection(cause: unknown, status?: number): boolean {
   const error = cause as { status?: number; message?: string }
-  if (error?.status === 401 || error?.status === 403) return false
-  if (error?.status && error.status >= 500) return false
+  const httpStatus = status ?? error?.status
+  if (httpStatus === 401 || httpStatus === 403 || httpStatus === 429) return false
+  if (httpStatus && httpStatus >= 500) return false
   const detail = error?.message ?? ''
   if (/fetch|network|timeout/i.test(detail)) return false
   return /Mutation too large|Folder does not belong to account|Invalid note|Invalid folder|Invalid mutation|不受支持/i.test(detail)
-}
-
-function isTransientSyncFailure(cause: unknown): boolean {
-  const error = cause as { status?: number; message?: string }
-  if (error?.status === 401 || error?.status === 403) return true
-  if (error?.status && error.status >= 500) return true
-  const detail = error?.message ?? ''
-  if (/fetch|network|timeout/i.test(detail)) return true
-  return typeof navigator !== 'undefined' && !navigator.onLine
 }
 
 async function rewriteNoteWithoutFolder(ownerId: string, mutation: Mutation): Promise<Mutation | null> {
@@ -180,21 +172,21 @@ async function uploadOne(ownerId: string, mutation: Mutation, token: string, ret
       for (const dependency of dependencies) await uploadOne(ownerId, dependency, token)
     }
   }
-  const { data, error } = await supabase.rpc('apply_mutation', {
+  const { data, error, status } = await supabase.rpc('apply_mutation', {
     p_mutation_id: mutation.id, p_entity: mutation.entity,
     p_entity_id: mutation.entityId, p_base_version: mutation.baseVersion,
     p_payload: mutation.payload
   }).setHeader('Authorization', `Bearer ${token}`)
   if (error) {
-    if (mutation.entity === 'note' && isPermanentRejection(error) && /Folder does not belong to account/i.test(error.message) && !retriedUncategorized) {
+    if (mutation.entity === 'note' && isPermanentRejection(error, status) && /Folder does not belong to account/i.test(error.message) && !retriedUncategorized) {
       const rewritten = await rewriteNoteWithoutFolder(ownerId, mutation)
       if (rewritten) return uploadOne(ownerId, rewritten, token, true)
     }
-    if (isPermanentRejection(error)) {
+    if (isPermanentRejection(error, status)) {
       await markRejected(ownerId, mutation, describeError(error))
       return
     }
-    throw error
+    throw Object.assign(new Error(error.message), { status: status ?? (error as { status?: number }).status })
   }
   const result = data as ApplyResult
   if (!result || !['ok', 'conflict'].includes(result.status)) throw new Error('服务器返回了无法识别的同步结果')
@@ -411,12 +403,7 @@ export async function syncOnce(ownerId: string): Promise<boolean> {
         || Number(b.entity === 'folder' && b.baseVersion === 0) - Number(a.entity === 'folder' && a.baseVersion === 0))
       for (const item of items) {
         if (item.state === 'conflict' || item.state === 'rejected') continue
-        try {
-          await uploadOne(ownerId, item, token)
-        } catch (cause) {
-          if (isTransientSyncFailure(cause)) throw cause
-          await markRejected(ownerId, item, describeError(cause))
-        }
+        await uploadOne(ownerId, item, token)
       }
       await pull(ownerId, token)
       await setError(ownerId, await remainingSyncWarning(ownerId))

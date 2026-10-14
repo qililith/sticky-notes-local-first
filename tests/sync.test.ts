@@ -423,7 +423,7 @@ describe('sync sequencing', () => {
     expect((await db.conflicts.get(conflict.id))?.local).toMatchObject({ title: '本机新版', plainText: '冲突后新写的正文' })
   })
 
-  it('rejects a conflict response for a different account without discarding local work', async () => {
+  it('keeps an uncertain conflict response for retry without discarding local work', async () => {
     const note = await createNote('account-a', null)
     rpc.mockImplementation(async (name: string) => name === 'pull_changes'
       ? { data: { items: [], next: '0' }, error: null }
@@ -432,10 +432,10 @@ describe('sync sequencing', () => {
         doc_version: 1, plain_text: '', folder_id: null, is_pinned: false,
         created_at: note.createdAt, updated_at: note.updatedAt, deleted_at: null, version: 1
       } }, error: null })
-    expect(await syncOnce('account-a')).toBe(true)
+    expect(await syncOnce('account-a')).toBe(false)
     expect(await db.conflicts.where('ownerId').equals('account-a').count()).toBe(0)
-    expect(await db.outbox.where('ownerId').equals('account-a').first()).toMatchObject({ state: 'rejected', error: expect.stringContaining('不匹配的冲突记录') })
-    expect((await db.syncMeta.get('account-a'))?.lastError).toContain('1 项被云端拒绝')
+    expect(await db.outbox.where('ownerId').equals('account-a').first()).toMatchObject({ state: 'inflight' })
+    expect((await db.syncMeta.get('account-a'))?.lastError).toContain('不匹配的冲突记录')
   })
 
   it('accepts an identical remote record without making a false conflict', async () => {
@@ -503,7 +503,7 @@ describe('sync sequencing', () => {
     expect((await db.syncMeta.get('account-a'))?.lastError).toContain('1 项被云端拒绝')
   })
 
-  it('isolates an unclassified upload failure so later notes and pull still run', async () => {
+  it('stops on an uncertain upload response without changing its mutation ID', async () => {
     const broken = await createNote('account-a', null)
     const healthy = await createNote('account-a', null)
     const brokenMutation = (await db.outbox.where('entityId').equals(broken.id).first())!
@@ -520,11 +520,38 @@ describe('sync sequencing', () => {
         folder_id: null, is_pinned: false, created_at: healthy.createdAt, updated_at: healthy.updatedAt, deleted_at: null, version: 1
       } }, error: null }
     })
-    expect(await syncOnce('account-a')).toBe(true)
-    expect(calls).toEqual([broken.id, healthy.id, 'pull'])
-    expect(await db.outbox.get(brokenMutation.id)).toMatchObject({ state: 'rejected', error: expect.stringContaining('不匹配的记录') })
-    expect(await db.outbox.where('entityId').equals(healthy.id).count()).toBe(0)
-    expect((await db.syncMeta.get('account-a'))?.lastError).toContain('1 项被云端拒绝')
+    expect(await syncOnce('account-a')).toBe(false)
+    expect(calls).toEqual([broken.id])
+    expect(await db.outbox.get(brokenMutation.id)).toMatchObject({ state: 'inflight' })
+    expect(await db.outbox.where('entityId').equals(healthy.id).count()).toBe(1)
+    expect((await db.syncMeta.get('account-a'))?.lastError).toContain('不匹配的记录')
+  })
+
+  it.each([401, 403, 429, 503])('keeps an SDK response with HTTP %i for retry', async status => {
+    const note = await createNote('account-a', null)
+    const mutation = (await db.outbox.where('entityId').equals(note.id).first())!
+    rpc.mockResolvedValue({ data: null, error: { message: 'Mutation too large' }, status })
+    expect(await syncOnce('account-a')).toBe(false)
+    expect(await db.outbox.get(mutation.id)).toMatchObject({ state: 'inflight', payload: { title: note.title } })
+    expect((await db.syncMeta.get('account-a'))?.lastError).toBeTruthy()
+  })
+
+  it('keeps the frozen request when cloud acceptance cannot be acknowledged locally', async () => {
+    const note = await createNote('account-a', null)
+    const mutation = (await db.outbox.where('entityId').equals(note.id).first())!
+    rpc.mockResolvedValue({ data: { status: 'ok', record: {
+      id: note.id, owner_id: 'account-a', title: note.title, doc: note.doc, doc_version: 1,
+      plain_text: note.plainText, folder_id: null, is_pinned: false,
+      created_at: note.createdAt, updated_at: note.updatedAt, deleted_at: null, version: 1
+    } }, error: null })
+    const failure = vi.spyOn(db.history, 'put').mockRejectedValueOnce(new DOMException('Storage full', 'QuotaExceededError'))
+    try { expect(await syncOnce('account-a')).toBe(false) } finally { failure.mockRestore() }
+    expect((await db.outbox.get(mutation.id))?.state).toBe('inflight')
+    await setNoteContent('account-a', note.id, emptyDocument, '新内容', '新标题', note.localRev)
+    const requests = await db.outbox.where('entityId').equals(note.id).toArray()
+    expect(requests).toHaveLength(2)
+    expect(requests.find(item => item.id === mutation.id)).toMatchObject({ state: 'inflight', payload: { title: note.title } })
+    expect(requests.find(item => item.id !== mutation.id)).toMatchObject({ state: 'pending', payload: { plainText: '新内容' } })
   })
 
   it('still stops the whole round on a network error', async () => {

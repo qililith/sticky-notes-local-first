@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { db } from '../src/data/db'
 import { downloadBackup, makeBackup, importBackup, parseBackup } from '../src/data/backup'
-import { clearAccountFromDevice, createFolder, createNote, createNoteWithContent, deleteFolder, reorderFolders, setNoteContent, updateFolder, updateNote } from '../src/data/repository'
+import { clearAccountFromDevice, createFolder, createNote, createNoteWithContent, deleteFolder, reorderFolders, restoreNoteRevision, setNoteContent, updateFolder, updateNote } from '../src/data/repository'
 import { isAccountSyncPaused, resumeAccountSync } from '../src/data/accountSyncGate'
 import { beginEditorWrite, setUnresolvedEditorDraft } from '../src/data/saveGuard'
 import { titleWithSuffix } from '../src/data/limits'
@@ -14,6 +14,26 @@ afterEach(async () => {
 })
 
 describe('local data', () => {
+  it('does not multiply unchanged history on repeated export and import', async () => {
+    const note = await createNoteWithContent('account-a', null, '标题', emptyDocument, '正文')
+    await db.history.put({ id: crypto.randomUUID(), ownerId: 'account-a', noteId: note.id,
+      serverVersion: 1, snapshot: { ...note, serverVersion: 1 }, createdAt: new Date().toISOString() })
+    await importBackup('account-a', await makeBackup('account-a'))
+    await importBackup('account-a', await makeBackup('account-a'))
+    expect(await db.history.where('[ownerId+noteId]').equals(['account-a', note.id]).count()).toBe(1)
+  })
+  it('preserves unsynced current content before restoring an older version', async () => {
+    const note = await createNoteWithContent('account-a', null, '新标题', emptyDocument, '未同步的新内容')
+    const revisionId = crypto.randomUUID()
+    await db.history.put({ id: revisionId, ownerId: 'account-a', noteId: note.id, serverVersion: 1,
+      snapshot: { ...note, title: '旧标题', plainText: '旧内容' }, createdAt: new Date().toISOString() })
+    await restoreNoteRevision('account-a', note.id, revisionId)
+    expect(await db.notes.get(note.id)).toMatchObject({ title: '旧标题', plainText: '旧内容' })
+    const copy = (await db.notes.where('ownerId').equals('account-a').toArray()).find(item => item.id !== note.id)
+    expect(copy).toMatchObject({ title: '新标题（恢复前副本）', plainText: '未同步的新内容' })
+    expect(await db.outbox.where('entityId').equals(copy!.id).count()).toBe(1)
+    expect((await makeBackup('account-a')).notes.some(item => item.id === copy!.id && item.plainText === '未同步的新内容')).toBe(true)
+  })
   it('saves a note and outbox entry atomically and coalesces pending edits', async () => {
     const note = await createNote('account-a', null)
     const changed = await setNoteContent('account-a', note.id, emptyDocument, '内容', '标题', note.localRev)

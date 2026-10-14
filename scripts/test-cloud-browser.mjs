@@ -604,7 +604,7 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
     await sibling.getByTitle('新建便签', { exact: true }).click()
     await sibling.getByLabel('便签标题', { exact: true }).fill(`升级失败草稿-${runId.slice(0, 8)}`)
     await sibling.getByLabel('便签正文', { exact: true }).fill('尚未发生错误时的原文。')
-    await wait(sibling.locator('.save-status')).toContainText('本地已保存')
+    await wait(sibling.locator('.sync-status-label')).toContainText('本地已保存')
     // Fail one actual IndexedDB write in this disposable browser, not a mocked React guard.
     await sibling.evaluate(() => {
       const original = IDBObjectStore.prototype.put
@@ -618,7 +618,7 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
     })
     const failedDraft = '另一窗口更新时，不能丢失这段尚未保存的草稿。'
     await sibling.getByLabel('便签正文', { exact: true }).fill(failedDraft)
-    await wait(sibling.locator('.save-status')).toHaveText('本地未保存')
+    await wait(sibling.locator('.sync-status-label')).toHaveText('本地未保存')
     const beforeOtherAccount = await rows(a1, 'notes', accounts[1].id)
     check(beforeOtherAccount.length > 0, 'Upgrade check needs another account cache')
     const beforeHistory = await rows(a1, 'history')
@@ -659,10 +659,10 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
     check(await a1.locator('script[type="module"]').first().getAttribute('src') !== oldScript, 'PWA kept its old entry bundle')
     step = 'Verify the other tab did not refresh away its failed draft'
     await wait(sibling.getByLabel('便签正文', { exact: true })).toHaveText(failedDraft)
-    await wait(sibling.locator('.save-status')).toHaveText('本地未保存')
+    await wait(sibling.locator('.sync-status-label')).toHaveText('本地未保存')
     check(forcedDraftReloads === 0, 'Other-tab activation tried to reload an unsaved draft')
     await sibling.getByRole('button', { name: '另存为新便签', exact: true }).click()
-    await wait(sibling.locator('.save-status')).toContainText('本地已保存')
+    await wait(sibling.locator('.sync-status-label')).toContainText('本地已保存')
     step = 'Explicitly refresh the previously deferred tab after saving its draft copy'
     await Promise.all([sibling.waitForEvent('load'), update(sibling).click()])
     await wait.poll(() => sibling.evaluate(() => document.documentElement.dataset.testBuild)).toBe(runId)
@@ -699,7 +699,7 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
       const page = pages[index]
       if (!page.isClosed()) {
         const state = await page.evaluate(() => ({ ready: document.readyState, upgraded: Boolean(document.documentElement.dataset.testBuild),
-          save: document.querySelector('.save-status')?.textContent ?? null })).catch(() => null)
+          save: document.querySelector('.sync-status-label')?.textContent ?? null })).catch(() => null)
         console.error(`UI ${index}: workspace=${await page.locator('.app-layout').isVisible().catch(() => false)} login=${await page.getByRole('heading', { name: '欢迎使用' }).isVisible().catch(() => false)} state=${JSON.stringify(state)}`)
         console.error(`UI ${index} transport failures: ${JSON.stringify(transportFailures.get(page) ?? [])}`)
         await diagnosticSnapshot(page, `failure-browser-${index}`).catch(() => {})

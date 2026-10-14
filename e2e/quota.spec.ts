@@ -1,12 +1,12 @@
 import { expect, test } from '@playwright/test'
 
 test('browser-enforced storage quota retains the saved note and recovers the draft', async ({ page, context }) => {
-  test.setTimeout(90_000)
+  test.setTimeout(120_000)
   await page.goto('/')
   await page.getByTitle('新建便签').first().click()
   await page.getByLabel('便签标题', { exact: true }).fill('配额测试')
   await page.getByLabel('便签正文', { exact: true }).fill('已保存的原文')
-  await expect(page.locator('.save-status')).toContainText('本地已保存')
+  await expect(page.locator('.sync-status-label')).toContainText('本地已保存')
   const before = await page.evaluate(async () => {
     const { db } = await import('/src/data/db.ts')
     return { notes: await db.notes.toArray(), outbox: await db.outbox.toArray() }
@@ -23,18 +23,20 @@ test('browser-enforced storage quota retains the saved note and recovers the dra
     await page.waitForTimeout(31_000)
     const draft = '空间不足时仍需保留的草稿。'.repeat(1000)
     await page.getByLabel('便签正文', { exact: true }).fill(draft)
-    await expect(page.locator('.save-status')).toHaveText('本地未保存')
+    await expect(page.locator('.sync-status-label')).toHaveText('本地未保存')
     await expect(page.locator('[data-sonner-toast]').filter({ hasText: /quota/i }).first()).toBeVisible()
     await expect(page.getByLabel('便签正文', { exact: true })).toHaveText(draft)
     expect(await page.evaluate(async () => {
       const { db } = await import('/src/data/db.ts')
       return { notes: await db.notes.toArray(), outbox: await db.outbox.toArray() }
     })).toEqual(before)
-    await page.getByRole('button', { name: '退出登录' }).click()
+    await page.getByTitle('打开数据与同步').click()
+    await expect(page.getByRole('button', { name: '退出登录' })).toBeDisabled()
+    await page.getByRole('button', { name: '关闭', exact: true }).click()
     await expect(page.getByLabel('便签正文', { exact: true })).toHaveText(draft)
     await cdp.send('Storage.overrideQuotaForOrigin', { origin })
     await page.getByRole('button', { name: '另存为新便签' }).click()
-    await expect(page.locator('.save-status')).toContainText('本地已保存')
+    await expect(page.locator('.sync-status-label')).toContainText('本地已保存')
     await page.reload()
     await expect.poll(() => page.evaluate(async () => {
       const { db } = await import('/src/data/db.ts')

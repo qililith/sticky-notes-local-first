@@ -18,7 +18,8 @@ test('cloud-sync panel downloads all five batch formats with account isolation',
   })
   await page.getByRole('button', { name: '设置', exact: true }).click()
   await page.getByRole('button', { name: /云同步/ }).click()
-  await expect(page.locator('.batch-export-section')).toContainText('3 条便签')
+  const exportSection = page.getByRole('heading', { name: '导出为文件' }).locator('..')
+  await expect(exportSection).toContainText('共 3 条')
   const before = await page.evaluate(async () => {
     const { db } = await import('/src/data/db.ts')
     return { notes: await db.notes.toArray(), outbox: await db.outbox.toArray() }
@@ -26,7 +27,7 @@ test('cloud-sync panel downloads all five batch formats with account isolation',
   for (const kind of ['txt-zip', 'md-zip', 'html-zip', 'txt-merged', 'md-merged']) {
     await page.getByRole('combobox', { name: '批量导出类型' }).selectOption(kind)
     const pending = page.waitForEvent('download')
-    await page.getByRole('button', { name: '开始批量导出' }).click()
+    await exportSection.getByRole('button', { name: '下载' }).click()
     const download = await pending
     expect(await download.failure()).toBeNull()
     const bytes = await readFile((await download.path())!)
@@ -39,10 +40,10 @@ test('cloud-sync panel downloads all five batch formats with account isolation',
     if (kind.endsWith('zip')) expect(Object.keys(unzipSync(bytes))).toHaveLength(3)
   }
   await page.getByRole('combobox', { name: '导出范围' }).selectOption({ label: '中文文件夹' })
-  await expect(page.locator('.batch-export-section')).toContainText('2 条便签')
+  await expect(exportSection).toContainText('共 2 条')
   await page.getByRole('combobox', { name: '批量导出类型' }).selectOption('md-zip')
   const pending = page.waitForEvent('download')
-  await page.getByRole('button', { name: '开始批量导出' }).click()
+  await exportSection.getByRole('button', { name: '下载' }).click()
   const file = await pending
   const paths = Object.keys(unzipSync(await readFile((await file.path())!)))
   expect(paths).toHaveLength(2)

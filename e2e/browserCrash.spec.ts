@@ -14,7 +14,7 @@ test('saved notes and pending mutations survive a browser-process crash', async 
     await page.getByTitle('新建便签').first().click()
     await page.getByLabel('便签标题', { exact: true }).fill('异常退出恢复')
     await page.getByLabel('便签正文', { exact: true }).fill('已经提交到本地数据库的正文。')
-    await expect(page.locator('.save-status')).toContainText('本地已保存')
+    await expect(page.locator('.sync-status-label')).toContainText('本地已保存')
     const before = await page.evaluate(async () => {
       const { db } = await import('/src/data/db.ts')
       return { notes: await db.notes.toArray(), outbox: await db.outbox.toArray() }

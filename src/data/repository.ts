@@ -1,8 +1,9 @@
 import { db } from './db'
 import { isAccountSyncPaused, notifyAccountCleared, pauseAccountSync, resumeAccountSync, withAccountSyncLock } from './accountSyncGate'
-import { checkedFolderName, checkedTitle } from './limits'
+import { checkedFolderName, checkedTitle, titleWithSuffix } from './limits'
 import { hasPendingEditorWrites, hasUnresolvedEditorDraft } from './saveGuard'
 import { recordPersistence } from './storageUsage'
+import { clearAccountRecoveryDrafts } from './recoveryDraft'
 import { emptyDocument, folderPayload, notePayload, type Entity, type Folder, type Mutation, type Note, type RichText } from './types'
 
 const now = () => new Date().toISOString()
@@ -97,6 +98,9 @@ export async function updateNote(
     if (expectedLocalRev !== undefined && current.localRev !== expectedLocalRev) {
       throw new Error('便签已在其他窗口修改，请先检查最新内容')
     }
+    if (Object.entries(change).every(([key, value]) =>
+      key === 'doc' ? JSON.stringify(current.doc) === JSON.stringify(value) : current[key as keyof Note] === value
+    )) return current
     const next = { ...current, ...change, localRev: current.localRev + 1, updatedAt: now() }
     await db.notes.put(next)
     await queueMutation('note', next)
@@ -107,6 +111,26 @@ export async function updateNote(
 
 export async function setNoteContent(ownerId: string, noteId: string, doc: RichText, plainText: string, title: string, expectedLocalRev?: number) {
   return updateNote(ownerId, noteId, { doc, plainText, title }, expectedLocalRev)
+}
+
+export async function restoreNoteRevision(ownerId: string, noteId: string, revisionId: string): Promise<void> {
+  requireOwner(ownerId)
+  if (hasPendingEditorWrites() || hasUnresolvedEditorDraft()) throw new Error('请先保存或另存当前草稿')
+  await db.transaction('rw', db.notes, db.outbox, db.conflicts, db.history, async () => {
+    requireWritableOwner(ownerId)
+    const current = await db.notes.get(noteId)
+    const revision = await db.history.get(revisionId)
+    if (!current || current.ownerId !== ownerId || !revision || revision.ownerId !== ownerId || revision.noteId !== noteId) {
+      throw new Error('便签或旧版本不存在')
+    }
+    const snapshot = revision.snapshot
+    if (current.title === snapshot.title && current.plainText === snapshot.plainText &&
+      JSON.stringify(current.doc) === JSON.stringify(snapshot.doc) && !current.deletedAt) return
+    await createNoteWithContent(ownerId, current.folderId, titleWithSuffix(current.title, '（恢复前副本）'), current.doc, current.plainText)
+    await updateNote(ownerId, noteId, {
+      title: snapshot.title, doc: snapshot.doc, plainText: snapshot.plainText, deletedAt: null
+    }, current.localRev)
+  })
 }
 
 export async function createFolder(ownerId: string, name: string): Promise<Folder> {
@@ -218,6 +242,7 @@ export async function clearAccountFromDevice(ownerId: string): Promise<void> {
         await db.history.where('ownerId').equals(ownerId).delete()
       })
     })
+    clearAccountRecoveryDrafts(ownerId)
     if (cloudAccount) notifyAccountCleared(ownerId)
   } catch (error) {
     if (cloudAccount && !wasPaused) resumeAccountSync(ownerId)

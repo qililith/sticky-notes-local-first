@@ -9,12 +9,13 @@ import type { Folder, Note, RichText } from '../data/types'
 import { MAX_TITLE_LENGTH, titleWithSuffix } from '../data/limits'
 import { beginEditorWrite } from '../data/saveGuard'
 import { downloadNoteExport, type NoteExportFormat } from '../data/noteExport'
+import { clearRecoveryDraft, readRecoveryDraft, writeRecoveryDraft } from '../data/recoveryDraft'
 
 type Props = {
   note: Note | null
   folders: Folder[]
   onEdit: (id: string, change: { title: string; doc: RichText; plainText: string }, expectedRev: number) => Promise<Note>
-  onSaveCopy: (change: { title: string; doc: RichText; plainText: string }) => Promise<void>
+  onSaveCopy: (change: { title: string; doc: RichText; plainText: string }) => Promise<boolean>
   onDiscardError: () => void
   onMoveFolder: (folderId: string | null) => void
   onOpenSidebar?: () => void
@@ -43,6 +44,7 @@ function EditorBody({ note, folders, onEdit, onSaveCopy, onDiscardError, onMoveF
   const expectedRev = useRef(note.localRev)
   const [saving, setSaving] = useState(false)
   const [externalChange, setExternalChange] = useState(false)
+  const [recoveryDraft, setRecoveryDraft] = useState(() => readRecoveryDraft(note.ownerId, note.id))
   const toolbarGroupRef = useRef<HTMLDivElement>(null)
   const folderMenuRef = useRef<HTMLDetailsElement>(null)
   const [toolbarOverflow, setToolbarOverflow] = useState(false)
@@ -56,18 +58,20 @@ function EditorBody({ note, folders, onEdit, onSaveCopy, onDiscardError, onMoveF
 
   const enqueue = useCallback((doc: RichText, plainText: string, nextTitle: string) => {
     const capturedId = note.id
+    const recoveryToken = writeRecoveryDraft(note.ownerId, capturedId, { doc, plainText, title: nextTitle })
     pendingWrites.current += 1
     const endWrite = beginEditorWrite()
     setSaving(true)
     saveQueue.current = saveQueue.current.catch(() => undefined).then(async () => {
       const saved = await onEdit(capturedId, { doc, plainText, title: nextTitle }, expectedRev.current)
       expectedRev.current = saved.localRev
+      if (recoveryToken) clearRecoveryDraft(note.ownerId, capturedId, recoveryToken)
     }).catch(() => undefined).finally(() => {
       pendingWrites.current -= 1
       endWrite()
       if (pendingWrites.current === 0) setSaving(false)
     })
-  }, [note.id, onEdit])
+  }, [note.id, note.ownerId, onEdit])
 
   const editor = useEditor({
     extensions: createEditorExtensions(),
@@ -191,6 +195,9 @@ function EditorBody({ note, folders, onEdit, onSaveCopy, onDiscardError, onMoveF
   const saveStatus = localError ? '本地未保存' : externalChange ? '其它窗口已更新' : saving ? '本地保存中…' : hasConflict ? '本地已保存 · 同步冲突' : syncError ? '本地已保存 · 同步失败' : pendingCount ? `本地已保存 · 待同步 ${pendingCount}` : '本地已保存'
   const idleSaveStatus = !localError && !externalChange && !saving && !hasConflict && !syncError && !pendingCount
   const hasSaveIssue = Boolean(localError || externalChange || hasConflict || syncError || syncIssueCount)
+  const hasRecoverableDraft = recoveryDraft && (recoveryDraft.title !== note.title
+    || recoveryDraft.plainText !== note.plainText || JSON.stringify(recoveryDraft.doc) !== JSON.stringify(note.doc))
+  useEffect(() => { editor?.setEditable(!hasRecoverableDraft) }, [editor, hasRecoverableDraft])
   const exportNote = (format: NoteExportFormat) => {
     if (!editor) return
     try {
@@ -233,6 +240,19 @@ function EditorBody({ note, folders, onEdit, onSaveCopy, onDiscardError, onMoveF
 
   return (
     <div className={`editor-container ${fullscreen ? 'fullscreen' : ''} ${isMobile ? 'mobile-editor' : ''}`}>
+      {hasRecoverableDraft && <div className="session-ended-banner" role="alert">
+        <span>上次关闭时有一段内容尚未确认保存。</span>
+        <button type="button" onClick={() => void (async () => {
+          if (await onSaveCopy({ title: titleWithSuffix(recoveryDraft.title, '（找回副本）'), doc: recoveryDraft.doc, plainText: recoveryDraft.plainText })) {
+            clearRecoveryDraft(note.ownerId, note.id, recoveryDraft.token)
+          }
+        })()}>另存这段内容</button>
+        <button type="button" onClick={() => {
+          if (!confirm('确认不需要找回上次未保存的内容？')) return
+          clearRecoveryDraft(note.ownerId, note.id, recoveryDraft.token)
+          setRecoveryDraft(null)
+        }}>保留当前便签</button>
+      </div>}
       {isMobile && <div className="mobile-editor-header">
         <button type="button" aria-label="返回列表" onClick={onBack}><ArrowLeft size={22} /></button>
         <div className="mobile-header-spacer" />
@@ -287,7 +307,7 @@ function EditorBody({ note, folders, onEdit, onSaveCopy, onDiscardError, onMoveF
           <button type="button" className="mobile-sync-status" onClick={onOpenConflicts} aria-label={`数据与同步：${saveStatus}`}><Database size={14} /><span>{saveStatus}</span>{syncIssueCount > 0 && <span> · {syncIssueCount} 项需处理</span>}</button>
           <span>{wordCount} 字</span>
         </div>}
-        <input ref={titleInputRef} className="editor-title" aria-label="便签标题" placeholder="便签标题" title={`标题最多 ${MAX_TITLE_LENGTH} 个字符`} maxLength={MAX_TITLE_LENGTH} value={title}
+        <input ref={titleInputRef} className="editor-title" aria-label="便签标题" placeholder="便签标题" title={`标题最多 ${MAX_TITLE_LENGTH} 个字符`} maxLength={MAX_TITLE_LENGTH} value={title} disabled={Boolean(hasRecoverableDraft)}
           onChange={event => {
             const next = event.target.value
             titleRef.current = next

@@ -1,4 +1,5 @@
 import { db } from './db'
+import type { Table } from 'dexie'
 
 export type PersistenceState = 'unknown' | 'granted' | 'denied' | 'unsupported'
 
@@ -46,17 +47,19 @@ export async function recordPersistence(): Promise<PersistenceState> {
 }
 
 export async function estimateAccountStorage(ownerId: string): Promise<AccountStorageEstimate> {
+  const tally = async <T extends { ownerId: string }>(table: Table<T, string>) => {
+    let count = 0
+    let bytes = 0
+    await table.where('ownerId').equals(ownerId).each(item => { count++; bytes += estimatedBytes(item) })
+    return { count, bytes }
+  }
   const [notes, folders, outbox, conflicts, history] = await Promise.all([
-    db.notes.where('ownerId').equals(ownerId).toArray(),
-    db.folders.where('ownerId').equals(ownerId).toArray(),
-    db.outbox.where('ownerId').equals(ownerId).toArray(),
-    db.conflicts.where('ownerId').equals(ownerId).toArray(),
-    db.history.where('ownerId').equals(ownerId).toArray()
+    tally(db.notes), tally(db.folders), tally(db.outbox), tally(db.conflicts), tally(db.history)
   ])
-  const noteBytes = estimatedBytes(notes) + estimatedBytes(folders)
-  const historyBytes = estimatedBytes(history)
-  const queueBytes = estimatedBytes(outbox)
-  const conflictBytes = estimatedBytes(conflicts)
+  const noteBytes = notes.bytes + folders.bytes
+  const historyBytes = history.bytes
+  const queueBytes = outbox.bytes
+  const conflictBytes = conflicts.bytes
   let siteUsageBytes: number | null = null
   let siteQuotaBytes: number | null = null
   try {
@@ -65,11 +68,11 @@ export async function estimateAccountStorage(ownerId: string): Promise<AccountSt
     if (estimate?.quota !== undefined) siteQuotaBytes = estimate.quota
   } catch { /* Browser storage estimate is optional. */ }
   return {
-    notes: notes.length,
-    folders: folders.length,
-    outbox: outbox.length,
-    conflicts: conflicts.length,
-    history: history.length,
+    notes: notes.count,
+    folders: folders.count,
+    outbox: outbox.count,
+    conflicts: conflicts.count,
+    history: history.count,
     noteBytes,
     historyBytes,
     queueBytes,

@@ -5,7 +5,7 @@ test('informational toasts do not block the data and sync toolbar', async ({ pag
   await page.goto('/')
   await page.getByTitle('新建文件夹', { exact: true }).click()
   await page.getByLabel('新文件夹名称').fill('提示遮挡回归')
-  await page.getByTitle('创建', { exact: true }).click()
+  await page.getByLabel('新文件夹名称').press('Enter')
   const toast = page.getByText('文件夹已创建', { exact: true })
   await expect(toast).toBeVisible()
   const notification = page.locator('[data-sonner-toast]').filter({ hasText: '文件夹已创建' })

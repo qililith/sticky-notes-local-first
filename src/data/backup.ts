@@ -175,11 +175,25 @@ export async function importBackup(ownerId: string, archive: BackupArchive): Pro
       await db.outbox.add({ id: crypto.randomUUID(), ownerId, entity: 'note', entityId: newId, baseVersion: 0, localRev: 1, payload: notePayload(note), createdAt: new Date().toISOString(), state: 'pending' })
       addedNotes++; copies++
     }
+    const historyByNote = new Map<string, { ids: Set<string>; contents: Set<string> }>()
     for (const source of archive.history) {
       const targetId = noteMap.get(source.noteId)!
       const id = `import:${ownerId}:${targetId}:${source.id}`
-      if (await db.history.get(id)) continue
-      await db.history.add({ ...source, id, ownerId, noteId: targetId, snapshot: { ...source.snapshot, id: targetId, ownerId, folderId: source.snapshot.folderId ? folderMap.get(source.snapshot.folderId) ?? null : null } })
+      const snapshot = { ...source.snapshot, id: targetId, ownerId,
+        folderId: source.snapshot.folderId ? folderMap.get(source.snapshot.folderId) ?? null : null }
+      let known = historyByNote.get(targetId)
+      if (!known) {
+        const existing = await db.history.where('[ownerId+noteId]').equals([ownerId, targetId]).toArray()
+        known = { ids: new Set(existing.map(item => item.id)),
+          contents: new Set(existing.map(item => `${item.serverVersion}\0${JSON.stringify(notePayload(item.snapshot))}`)) }
+        historyByNote.set(targetId, known)
+      }
+      const contentKey = `${source.serverVersion}\0${JSON.stringify(notePayload(snapshot))}`
+      if (known.ids.has(id) || known.contents.has(contentKey)) continue
+      const imported = { ...source, id, ownerId, noteId: targetId, snapshot }
+      await db.history.add(imported)
+      known.ids.add(id)
+      known.contents.add(contentKey)
     }
   })
   return { notes: addedNotes, folders: addedFolders, copies }
