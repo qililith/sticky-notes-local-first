@@ -5,7 +5,7 @@ async function createNamedNote(page: import('@playwright/test').Page, name: stri
   await expect(page.getByRole('textbox', { name: '便签标题' })).toHaveValue('')
   await page.getByRole('textbox', { name: '便签标题' }).fill(name)
   await expect(page.locator('.note-item-title').filter({ hasText: name })).toBeVisible()
-  await expect(page.locator('.save-status')).toContainText('本地已保存')
+  await expect(page.locator('.sync-status-label')).toContainText('本地已保存')
 }
 
 test('pending local writes block navigation until they finish', async ({ page }) => {
@@ -20,8 +20,10 @@ test('pending local writes block navigation until they finish', async ({ page })
   await page.locator('.note-item').filter({ hasText: '便签 B' }).click()
   await expect(page.getByRole('textbox', { name: '便签标题' })).toHaveValue('便签 A')
   await expect(page.getByText('本地仍在保存，请稍等再切换')).not.toBeVisible()
+  await page.getByTitle('打开数据与同步').click()
   await page.getByRole('button', { name: '退出登录' }).click()
   await expect(page.getByRole('textbox', { name: '便签标题' })).toHaveValue('便签 A')
+  await page.getByRole('button', { name: '关闭', exact: true }).click()
   await page.evaluate(() => {
     const finish = (window as Window & { __finishTestWrite?: () => void }).__finishTestWrite
     finish?.()
@@ -57,12 +59,14 @@ test('a failed local save retains the draft and blocks leaving until copied', as
     }
   })
   await page.getByRole('textbox', { name: '便签标题' }).fill('未保存草稿')
-  await expect(page.locator('.save-status')).toHaveText('本地未保存')
+  await expect(page.locator('.sync-status-label')).toHaveText('本地未保存')
   expect(await page.evaluate(async () => (await import('/src/data/saveGuard.ts')).hasUnresolvedEditorDraft())).toBe(true)
   await page.locator('.note-item').filter({ hasText: '便签 B' }).click()
   await expect(page.getByRole('textbox', { name: '便签标题' })).toHaveValue('未保存草稿')
-  await page.getByRole('button', { name: '退出登录' }).click()
+  await page.getByTitle('打开数据与同步').click()
+  await expect(page.getByRole('button', { name: '退出登录' })).toBeDisabled()
   await expect(page.getByRole('textbox', { name: '便签标题' })).toHaveValue('未保存草稿')
+  await page.getByRole('button', { name: '关闭', exact: true }).click()
   await page.evaluate(() => {
     Object.defineProperty(navigator, 'clipboard', {
       configurable: true,
@@ -78,7 +82,7 @@ test('a failed local save retains the draft and blocks leaving until copied', as
     await db.conflicts.put({ id: crypto.randomUUID(), ownerId: note.ownerId, entity: 'note', entityId: note.id,
       local: note, remote: { ...note, title: '云端版本', serverVersion: 1 }, createdAt: new Date().toISOString() })
   })
-  await page.getByRole('button', { name: '数据与同步' }).click()
+  await page.getByTitle('打开数据与同步').click()
   const panel = page.getByRole('dialog', { name: '数据与同步' })
   await expect(panel.getByRole('button', { name: '导出备份' })).toBeDisabled()
   await expect(panel.getByRole('button', { name: '清除本机数据并退出' })).toBeDisabled()
@@ -110,7 +114,7 @@ test('external deletion keeps a failed draft available for recovery', async ({ p
     }
   })
   await page.getByRole('textbox', { name: '便签标题' }).fill('未保存的删除前草稿')
-  await expect(page.locator('.save-status')).toHaveText('本地未保存')
+  await expect(page.locator('.sync-status-label')).toHaveText('本地未保存')
   await page.evaluate(async () => {
     const { db } = await import('/src/data/db.ts')
     const note = await db.notes.where('ownerId').equals('local-demo').filter(item => item.title === '待删便签').first()
@@ -139,8 +143,8 @@ test('mobile editor keeps the unsaved warning and recovery actions in view', asy
     }
   })
   await title.fill('手机草稿')
-  await expect(page.locator('.save-status')).toHaveText('本地未保存')
-  await expect(page.locator('.save-status')).toBeInViewport()
+  await expect(page.locator('.sync-status-label')).toHaveText('本地未保存')
+  await expect(page.getByRole('button', { name: /数据与同步：本地未保存/ })).toBeInViewport()
   await expect(page.getByRole('button', { name: '复制草稿文本' })).toBeInViewport()
   await page.getByRole('button', { name: '返回列表' }).click()
   await expect(title).toHaveValue('手机草稿')
@@ -160,7 +164,7 @@ test('an external update does not replace a draft whose local save failed', asyn
   })
   const title = page.getByRole('textbox', { name: '便签标题' })
   await title.fill('未保存的标题')
-  await expect(page.locator('.save-status')).toHaveText('本地未保存')
+  await expect(page.locator('.sync-status-label')).toHaveText('本地未保存')
   await page.evaluate(async () => {
     const { db } = await import('/src/data/db.ts')
     const note = await db.notes.where('ownerId').equals('local-demo').first()
