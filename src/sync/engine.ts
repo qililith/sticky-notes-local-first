@@ -1,31 +1,47 @@
 import { supabase } from '../auth'
 import { isAccountSyncPaused, withAccountSyncLock } from '../data/accountSyncGate'
 import { db } from '../data/db'
+import { sameStructuredValue } from '../data/equality'
 import { hasPendingEditorWrites, hasUnresolvedEditorDraft } from '../data/saveGuard'
 import { detachNotesFromFolder, updateNote } from '../data/repository'
+import { subscribeSyncNeeded } from '../data/syncSignal'
 import { folderPayload, notePayload, type Conflict, type DeferredChange, type Folder, type FolderPayload, type Mutation, type Note, type NotePayload, type SyncMeta } from '../data/types'
 
 type RemoteRow = Record<string, unknown> & { id: string; owner_id: string; version: number }
 type ApplyResult = { status: 'ok' | 'conflict'; record: RemoteRow | null; seq?: string }
 type PullResult = { items: { seq: string; entity: 'note' | 'folder'; record: RemoteRow }[]; next: string }
 
-function sameJson(left: unknown, right: unknown): boolean {
-  if (left === right) return true
-  if (!left || !right || typeof left !== 'object' || typeof right !== 'object') return false
-  if (Array.isArray(left) || Array.isArray(right)) {
-    return Array.isArray(left) && Array.isArray(right) && left.length === right.length
-      && left.every((item, index) => sameJson(item, right[index]))
+export const SYNC_REQUEST_TIMEOUT_MS = 30_000
+export const LOCAL_WRITE_SYNC_DELAY_MS = 1_500
+
+type SyncRuntimeOptions = {
+  requestTimeoutMs?: number
+  localWriteDelayMs?: number
+}
+
+async function requestWithTimeout<T>(
+  request: PromiseLike<T> & { abortSignal(signal: AbortSignal): PromiseLike<T> },
+  timeoutMs: number
+): Promise<T> {
+  const controller = new AbortController()
+  let timer: number | undefined
+  const timeout = new Promise<never>((_, reject) => {
+    timer = window.setTimeout(() => {
+      controller.abort()
+      reject(new Error(`同步请求超时（${Math.ceil(timeoutMs / 1000)} 秒）`))
+    }, timeoutMs)
+  })
+  try {
+    return await Promise.race([Promise.resolve(request.abortSignal(controller.signal)), timeout])
+  } finally {
+    window.clearTimeout(timer)
   }
-  const a = left as Record<string, unknown>
-  const b = right as Record<string, unknown>
-  const keys = Object.keys(a)
-  return keys.length === Object.keys(b).length && keys.every(key => Object.hasOwn(b, key) && sameJson(a[key], b[key]))
 }
 
 function sameRemoteContent(mutation: Mutation, row: RemoteRow): boolean {
   if (mutation.entity === 'note') {
     const payload = mutation.payload as NotePayload
-    return row.title === payload.title && sameJson(row.doc, payload.doc)
+    return row.title === payload.title && sameStructuredValue(row.doc, payload.doc)
       && row.doc_version === payload.docVersion && row.plain_text === payload.plainText
       && (row.folder_id ?? null) === payload.folderId && row.is_pinned === payload.isPinned
       && Boolean(row.deleted_at) === Boolean(payload.deletedAt)
@@ -143,7 +159,7 @@ async function rewriteNoteWithoutFolder(ownerId: string, mutation: Mutation): Pr
   })
 }
 
-async function uploadOne(ownerId: string, mutation: Mutation, token: string, retriedUncategorized = false) {
+async function uploadOne(ownerId: string, mutation: Mutation, token: string, timeoutMs: number, retriedUncategorized = false) {
   if (!supabase) return
   const fresh = await db.outbox.get(mutation.id)
   if (!fresh || fresh.ownerId !== ownerId || fresh.state === 'conflict' || fresh.state === 'rejected') return
@@ -169,18 +185,18 @@ async function uploadOne(ownerId: string, mutation: Mutation, token: string, ret
     if (folder && folder.ownerId === ownerId && !folder.deletedAt) {
       const dependencies = await db.outbox.where('[ownerId+entity+entityId]')
         .equals([ownerId, 'folder', folder.id]).sortBy('createdAt')
-      for (const dependency of dependencies) await uploadOne(ownerId, dependency, token)
+      for (const dependency of dependencies) await uploadOne(ownerId, dependency, token, timeoutMs)
     }
   }
-  const { data, error, status } = await supabase.rpc('apply_mutation', {
+  const { data, error, status } = await requestWithTimeout(supabase.rpc('apply_mutation', {
     p_mutation_id: mutation.id, p_entity: mutation.entity,
     p_entity_id: mutation.entityId, p_base_version: mutation.baseVersion,
     p_payload: mutation.payload
-  }).setHeader('Authorization', `Bearer ${token}`)
+  }).setHeader('Authorization', `Bearer ${token}`), timeoutMs)
   if (error) {
     if (mutation.entity === 'note' && isPermanentRejection(error, status) && /Folder does not belong to account/i.test(error.message) && !retriedUncategorized) {
       const rewritten = await rewriteNoteWithoutFolder(ownerId, mutation)
-      if (rewritten) return uploadOne(ownerId, rewritten, token, true)
+      if (rewritten) return uploadOne(ownerId, rewritten, token, timeoutMs, true)
     }
     if (isPermanentRejection(error, status)) {
       await markRejected(ownerId, mutation, describeError(error))
@@ -328,12 +344,12 @@ function deferredKey(entity: string, id: string) {
   return `${entity}:${id}`
 }
 
-async function pull(ownerId: string, token: string) {
+async function pull(ownerId: string, token: string, timeoutMs: number) {
   if (!supabase) return
   let cursor = (await meta(ownerId)).cursor
   for (;;) {
-    const { data, error } = await supabase.rpc('pull_changes', { p_after: cursor, p_limit: 100 })
-      .setHeader('Authorization', `Bearer ${token}`)
+    const { data, error } = await requestWithTimeout(supabase.rpc('pull_changes', { p_after: cursor, p_limit: 100 })
+      .setHeader('Authorization', `Bearer ${token}`), timeoutMs)
     if (error) throw error
     const page = data as PullResult
     if (!page || !Array.isArray(page.items) || typeof page.next !== 'string') throw new Error('服务器返回了无法识别的变更列表')
@@ -392,8 +408,9 @@ async function remainingSyncWarning(ownerId: string): Promise<string | null> {
   return parts.length ? parts.join('；') : null
 }
 
-export async function syncOnce(ownerId: string): Promise<boolean> {
-  if (!supabase || !navigator.onLine || isAccountSyncPaused(ownerId)) return false
+export async function syncOnce(ownerId: string, options: SyncRuntimeOptions = {}): Promise<boolean> {
+  if (!supabase || isAccountSyncPaused(ownerId)) return false
+  const timeoutMs = options.requestTimeoutMs ?? SYNC_REQUEST_TIMEOUT_MS
   const run = async (): Promise<boolean> => {
     if (isAccountSyncPaused(ownerId)) return false
     try {
@@ -401,11 +418,25 @@ export async function syncOnce(ownerId: string): Promise<boolean> {
       const items = await db.outbox.where('ownerId').equals(ownerId).sortBy('createdAt')
       items.sort((a, b) => a.createdAt.localeCompare(b.createdAt)
         || Number(b.entity === 'folder' && b.baseVersion === 0) - Number(a.entity === 'folder' && a.baseVersion === 0))
+      let uploadFailure: unknown = null
       for (const item of items) {
         if (item.state === 'conflict' || item.state === 'rejected') continue
-        await uploadOne(ownerId, item, token)
+        try { await uploadOne(ownerId, item, token, timeoutMs) }
+        catch (cause) { uploadFailure = cause; break }
       }
-      await pull(ownerId, token)
+      let pullFailure: unknown = null
+      const uploadError = uploadFailure as { status?: number; message?: string } | null
+      const skipPull = uploadError?.status === 401 || uploadError?.status === 403
+        || /当前登录账号与本地数据不匹配/.test(uploadError?.message ?? '')
+      if (!skipPull) {
+        try { await pull(ownerId, token, timeoutMs) }
+        catch (cause) { pullFailure = cause }
+      }
+      const failure = uploadFailure ?? pullFailure
+      if (failure) {
+        await setError(ownerId, describeError(failure))
+        return false
+      }
       await setError(ownerId, await remainingSyncWarning(ownerId))
       return true
     } catch (cause) {
@@ -458,9 +489,10 @@ export async function resolveConflict(ownerId: string, conflictId: string, choic
   await syncOnce(ownerId)
 }
 
-export function startSync(ownerId: string) {
+export function startSync(ownerId: string, options: SyncRuntimeOptions = {}) {
   let timer: number | undefined
   let authTimer: number | undefined
+  let localWriteTimer: number | undefined
   let failures = 0
   let running = false
   let stopped = false
@@ -469,14 +501,27 @@ export function startSync(ownerId: string) {
     if (stopped) return
     if (running) { rerun = true; return }
     running = true
-    const success = await syncOnce(ownerId)
-    running = false
+    let success = false
+    try { success = await syncOnce(ownerId, options) }
+    catch { success = false }
+    finally { running = false }
     if (stopped) return
     failures = success ? 0 : Math.min(failures + 1, 4)
     timer = window.setTimeout(() => void trigger(), rerun ? 0 : 30_000 * (2 ** failures))
     rerun = false
   }
-  const immediate = () => { window.clearTimeout(timer); failures = 0; void trigger() }
+  const immediate = () => {
+    window.clearTimeout(timer)
+    window.clearTimeout(localWriteTimer)
+    failures = 0
+    void trigger()
+  }
+  const onLocalWrite = (requestedOwnerId: string) => {
+    if (requestedOwnerId !== ownerId || stopped) return
+    window.clearTimeout(localWriteTimer)
+    localWriteTimer = window.setTimeout(immediate, options.localWriteDelayMs ?? LOCAL_WRITE_SYNC_DELAY_MS)
+  }
+  const unsubscribeSyncNeeded = subscribeSyncNeeded(onLocalWrite)
   const subscription = supabase?.auth.onAuthStateChange((event, session) => {
     if (stopped || event !== 'TOKEN_REFRESHED' || session?.user.id !== ownerId) return
     // Refresh can recover after getSession returned a cached offline error.
@@ -487,12 +532,18 @@ export function startSync(ownerId: string) {
   immediate()
   window.addEventListener('online', immediate)
   window.addEventListener('focus', immediate)
+  window.addEventListener('pageshow', immediate)
+  document.addEventListener('visibilitychange', immediate)
   return () => {
     stopped = true
     window.clearTimeout(timer)
     window.clearTimeout(authTimer)
+    window.clearTimeout(localWriteTimer)
     subscription?.unsubscribe()
+    unsubscribeSyncNeeded()
     window.removeEventListener('online', immediate)
     window.removeEventListener('focus', immediate)
+    window.removeEventListener('pageshow', immediate)
+    document.removeEventListener('visibilitychange', immediate)
   }
 }

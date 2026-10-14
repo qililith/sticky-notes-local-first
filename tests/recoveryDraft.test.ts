@@ -1,8 +1,8 @@
-import { afterEach, expect, it } from 'vitest'
-import { clearAccountRecoveryDrafts, clearRecoveryDraft, readRecoveryDraft, writeRecoveryDraft } from '../src/data/recoveryDraft'
+import { afterEach, expect, it, vi } from 'vitest'
+import { clearAccountRecoveryDrafts, clearRecoveryDraft, listAccountRecoveryDrafts, readRecoveryDraft, RECOVERY_DRAFT_TTL_MS, writeRecoveryDraft } from '../src/data/recoveryDraft'
 import { emptyDocument } from '../src/data/types'
 
-afterEach(() => localStorage.clear())
+afterEach(() => { localStorage.clear(); vi.useRealTimers() })
 
 it('keeps the newest browser-close draft until that exact write is saved', () => {
   const original = writeRecoveryDraft('account-a', 'note-a', { title: '标题', doc: emptyDocument, plainText: '第一段' })!
@@ -20,4 +20,18 @@ it('clears only the selected account after an explicit device reset', () => {
   clearAccountRecoveryDrafts('account-a')
   expect(readRecoveryDraft('account-a', 'note-a')).toBeNull()
   expect(readRecoveryDraft('account-b', 'note-b')?.plainText).toBe('B')
+})
+
+it('lists recoverable drafts even when their original note is missing', () => {
+  writeRecoveryDraft('account-a', 'missing-note', { title: '丢失的便签', doc: emptyDocument, plainText: '待恢复内容' })
+  expect(listAccountRecoveryDrafts('account-a').map(draft => [draft.noteId, draft.plainText])).toEqual([['missing-note', '待恢复内容']])
+})
+
+it('expires recovery drafts after the short retention window', () => {
+  vi.useFakeTimers()
+  vi.setSystemTime(new Date('2026-10-14T12:00:00.000Z'))
+  writeRecoveryDraft('account-a', 'note-a', { title: '临时内容', doc: emptyDocument, plainText: '临时' })
+  vi.setSystemTime(new Date(Date.now() + RECOVERY_DRAFT_TTL_MS + 1))
+  expect(readRecoveryDraft('account-a', 'note-a')).toBeNull()
+  expect(localStorage.length).toBe(0)
 })

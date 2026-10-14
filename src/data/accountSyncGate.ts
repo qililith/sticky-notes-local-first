@@ -2,16 +2,20 @@ const pausedPrefix = 'sticky-notes-sync-paused:'
 const clearedPrefix = 'sticky-notes-account-cleared:'
 const queues = new Map<string, Promise<void>>()
 
+export function accountSyncPausedKey(ownerId: string): string {
+  return `${pausedPrefix}${ownerId}`
+}
+
 export function isAccountSyncPaused(ownerId: string): boolean {
-  return localStorage.getItem(`${pausedPrefix}${ownerId}`) === '1'
+  return localStorage.getItem(accountSyncPausedKey(ownerId)) === '1'
 }
 
 export function pauseAccountSync(ownerId: string): void {
-  localStorage.setItem(`${pausedPrefix}${ownerId}`, '1')
+  localStorage.setItem(accountSyncPausedKey(ownerId), '1')
 }
 
 export function resumeAccountSync(ownerId: string): void {
-  localStorage.removeItem(`${pausedPrefix}${ownerId}`)
+  localStorage.removeItem(accountSyncPausedKey(ownerId))
 }
 
 export function accountClearedEventKey(ownerId: string): string {
@@ -37,4 +41,3 @@ export async function withAccountSyncLock<T>(ownerId: string, run: () => Promise
     if (queues.get(name) === current) queues.delete(name)
   }
 }
-

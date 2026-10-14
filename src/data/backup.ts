@@ -1,6 +1,7 @@
 import { db } from './db'
 import { isAccountSyncPaused } from './accountSyncGate'
 import { titleWithSuffix } from './limits'
+import { notifySyncNeeded } from './syncSignal'
 import { validateBackup } from './backupValidation'
 import { hasPendingEditorWrites, hasUnresolvedEditorDraft } from './saveGuard'
 import { folderPayload, notePayload, type Conflict, type Folder, type Mutation, type Note, type Revision } from './types'
@@ -196,5 +197,6 @@ export async function importBackup(ownerId: string, archive: BackupArchive): Pro
       known.contents.add(contentKey)
     }
   })
+  if (addedNotes || addedFolders) notifySyncNeeded(ownerId)
   return { notes: addedNotes, folders: addedFolders, copies }
 }

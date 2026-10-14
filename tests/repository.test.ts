@@ -5,7 +5,8 @@ import { clearAccountFromDevice, createFolder, createNote, createNoteWithContent
 import { isAccountSyncPaused, resumeAccountSync } from '../src/data/accountSyncGate'
 import { beginEditorWrite, setUnresolvedEditorDraft } from '../src/data/saveGuard'
 import { titleWithSuffix } from '../src/data/limits'
-import { emptyDocument } from '../src/data/types'
+import { subscribeSyncNeeded } from '../src/data/syncSignal'
+import { emptyDocument, type RichText } from '../src/data/types'
 
 afterEach(async () => {
   setUnresolvedEditorDraft(false)
@@ -43,6 +44,28 @@ describe('local data', () => {
     expect(queued).toHaveLength(1)
     expect(queued[0].localRev).toBe(2)
     expect(queued[0].payload).toMatchObject({ title: '标题', plainText: '内容' })
+  })
+
+  it('does not queue a new version when only JSON object key order changed', async () => {
+    const storedDoc = { content: [{ content: [{ text: '正文', type: 'text' }], type: 'paragraph' }], type: 'doc' } as RichText
+    const equivalentDoc = { type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text: '正文' }] }] } as RichText
+    const note = await createNoteWithContent('account-a', null, '标题', storedDoc, '正文')
+    const unchanged = await setNoteContent('account-a', note.id, equivalentDoc, '正文', '标题', note.localRev)
+    expect(unchanged.localRev).toBe(note.localRev)
+    expect(await db.outbox.where('entityId').equals(note.id).count()).toBe(1)
+  })
+
+  it('signals sync only after a local note transaction succeeds', async () => {
+    const owners: string[] = []
+    const unsubscribe = subscribeSyncNeeded(ownerId => owners.push(ownerId))
+    try {
+      const note = await createNote('account-a', null)
+      await updateNote('account-a', note.id, { title: '已落库' })
+      const broken = vi.spyOn(db.outbox, 'add').mockRejectedValueOnce(new DOMException('Storage full', 'QuotaExceededError'))
+      try { await expect(createNote('account-a', null)).rejects.toThrow('Storage full') }
+      finally { broken.mockRestore() }
+      expect(owners).toEqual(['account-a', 'account-a'])
+    } finally { unsubscribe() }
   })
 
   it('rolls back a new note if the outbox write fails', async () => {
