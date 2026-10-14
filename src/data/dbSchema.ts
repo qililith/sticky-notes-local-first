@@ -8,3 +8,8 @@ export const notesDbStoresV1 = {
   syncMeta: 'ownerId',
   history: 'id, ownerId, noteId, serverVersion, [ownerId+noteId]'
 } as const
+
+export const notesDbStoresV2 = {
+  ...notesDbStoresV1,
+  history: `${notesDbStoresV1.history}, [ownerId+noteId+serverVersion]`
+} as const
