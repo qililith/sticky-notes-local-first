@@ -9,10 +9,11 @@ export type RecoveryDraft = {
   doc: RichText
   plainText: string
   savedAt: string
+  baseLocalRev?: number
 }
 
 type RecoveryDraftValue = Omit<RecoveryDraft, 'noteId'>
-type DraftChange = Pick<RecoveryDraft, 'title' | 'doc' | 'plainText'>
+type DraftChange = Pick<RecoveryDraft, 'title' | 'doc' | 'plainText'> & Pick<RecoveryDraft, 'baseLocalRev'>
 
 const prefix = (ownerId: string) => `sticky-notes-recovery:${ownerId}:`
 const key = (ownerId: string, noteId: string) => `${prefix(ownerId)}${noteId}`
@@ -29,7 +30,9 @@ function readStored(raw: string, noteId: string): RecoveryDraft | null {
     const savedAt = typeof draft.savedAt === 'string' && Number.isFinite(Date.parse(draft.savedAt))
       ? draft.savedAt : new Date().toISOString()
     if (Date.now() - Date.parse(savedAt) > RECOVERY_DRAFT_TTL_MS || Date.parse(savedAt) > Date.now() + 5 * 60 * 1000) return null
-    return { ...draft, noteId, savedAt }
+    const baseLocalRev = typeof draft.baseLocalRev === 'number' && Number.isSafeInteger(draft.baseLocalRev) && draft.baseLocalRev >= 0
+      ? draft.baseLocalRev : undefined
+    return { ...draft, noteId, savedAt, baseLocalRev }
   } catch { return null }
 }
 

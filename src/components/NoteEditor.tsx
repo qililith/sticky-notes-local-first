@@ -47,6 +47,7 @@ function EditorBody({ note, folders, onEdit, onSaveCopy, onDiscardError, onMoveF
   const latestRecoveryChange = useRef<{ doc: RichText; plainText: string; title: string } | null>(null)
   const recoveryWriteTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const recoveryToken = useRef<string | null>(null)
+  const recoveryRestoreStarted = useRef(false)
   const saveQueueRunning = useRef(false)
   const expectedRev = useRef(note.localRev)
   const [saving, setSaving] = useState(false)
@@ -68,7 +69,7 @@ function EditorBody({ note, folders, onEdit, onSaveCopy, onDiscardError, onMoveF
     recoveryWriteTimer.current = null
     const latest = latestRecoveryChange.current
     if (!latest) return
-    recoveryToken.current = writeRecoveryDraft(note.ownerId, note.id, latest)
+    recoveryToken.current = writeRecoveryDraft(note.ownerId, note.id, { ...latest, baseLocalRev: expectedRev.current })
   }, [note.id, note.ownerId])
 
   useEffect(() => {
@@ -111,7 +112,7 @@ function EditorBody({ note, folders, onEdit, onSaveCopy, onDiscardError, onMoveF
             if (recoveryToken.current) clearRecoveryDraft(note.ownerId, capturedId, recoveryToken.current)
             recoveryToken.current = null
           }
-        } catch { /* onEdit reports the failure; keep the recovery draft for the user. */ }
+        } catch { persistRecoveryDraft() /* onEdit reports the failure; keep the recovery draft for the user. */ }
       }
     ).finally(() => {
       saveQueueRunning.current = false
@@ -157,7 +158,8 @@ function EditorBody({ note, folders, onEdit, onSaveCopy, onDiscardError, onMoveF
   }, [note.id])
 
   useEffect(() => {
-    if (!editor || note.localRev <= expectedRev.current) return
+    if (!editor) return
+    if (note.localRev <= expectedRev.current) { setExternalChange(false); return }
     if (saving || localError || editor.isFocused || document.activeElement === titleInputRef.current) { setExternalChange(true); return }
     editor.commands.setContent(note.doc, { emitUpdate: false })
     titleRef.current = note.title
@@ -169,6 +171,7 @@ function EditorBody({ note, folders, onEdit, onSaveCopy, onDiscardError, onMoveF
   }, [editor, note.localRev, note.doc, note.title, note.plainText, saving, localError, onDiscardError])
 
   useEffect(() => {
+    if (recoveryRestoreStarted.current) return
     titleRef.current = note.title
     setTitle(note.title)
   }, [note.id])
@@ -242,8 +245,22 @@ function EditorBody({ note, folders, onEdit, onSaveCopy, onDiscardError, onMoveF
   const saveStatus = localError ? '本地未保存' : externalChange ? '其它窗口已更新' : saving ? '本地保存中…' : hasConflict ? '本地已保存 · 同步冲突' : syncError ? '本地已保存 · 同步失败' : pendingCount ? `本地已保存 · 待同步 ${pendingCount}` : '本地已保存'
   const idleSaveStatus = !localError && !externalChange && !saving && !hasConflict && !syncError && !pendingCount
   const hasSaveIssue = Boolean(localError || externalChange || hasConflict || syncError || syncIssueCount)
-  const hasRecoverableDraft = recoveryDraft && (recoveryDraft.title !== note.title
+  const recoveryDraftDiffers = recoveryDraft && (recoveryDraft.title !== note.title
     || recoveryDraft.plainText !== note.plainText || !sameStructuredValue(recoveryDraft.doc, note.doc))
+  const canRestoreRecoveryInPlace = recoveryDraftDiffers && recoveryDraft.baseLocalRev === note.localRev
+  const hasRecoverableDraft = recoveryDraftDiffers && !canRestoreRecoveryInPlace
+  useEffect(() => {
+    if (!editor || !canRestoreRecoveryInPlace || recoveryRestoreStarted.current) return
+    recoveryRestoreStarted.current = true
+    recoveryToken.current = recoveryDraft.token
+    editor.commands.setContent(recoveryDraft.doc, { emitUpdate: false })
+    titleRef.current = recoveryDraft.title
+    setTitle(recoveryDraft.title)
+    setWordCount(recoveryDraft.plainText.length)
+    setRecoveryDraft(null)
+    enqueue(recoveryDraft.doc, recoveryDraft.plainText, recoveryDraft.title)
+    toast.success('已找回上次未完成的内容，正在保存')
+  }, [editor, canRestoreRecoveryInPlace, recoveryDraft, enqueue])
   useEffect(() => { editor?.setEditable(!hasRecoverableDraft) }, [editor, hasRecoverableDraft])
   const exportNote = (format: NoteExportFormat) => {
     if (!editor) return
@@ -321,6 +338,10 @@ function EditorBody({ note, folders, onEdit, onSaveCopy, onDiscardError, onMoveF
         <button type="button" className={`sync-status-button ${localError || externalChange || hasConflict || syncError ? 'unsaved' : ''} ${idleSaveStatus ? 'is-idle' : ''}`} title="打开数据与同步" onClick={onOpenConflicts}><Database size={15} /><span className="sync-status-label">{saveStatus}</span>{syncIssueCount > 0 && <span className="sync-issue-badge" aria-label={`${syncIssueCount} 项需要处理`}>{syncIssueCount}</span>}</button>
         {hasConflict && <button type="button" className="toolbar-btn recovery-btn" onClick={onOpenConflicts}>处理冲突</button>}
         {syncError && !hasConflict && <button type="button" className="toolbar-btn recovery-btn" onClick={onOpenConflicts}>查看同步问题</button>}
+        {localError && !saving && <button type="button" className="toolbar-btn recovery-btn" onClick={() => {
+          if (!editor) return
+          enqueue(editor.getJSON() as RichText, editor.getText({ blockSeparator: '\n' }), titleRef.current)
+        }}>重新保存</button>}
         {(localError || externalChange) && <button type="button" className="toolbar-btn recovery-btn" onClick={() => {
           if (!editor) return
           void onSaveCopy({ title: titleWithSuffix(titleRef.current, '（恢复副本）'), doc: editor.getJSON() as RichText, plainText: editor.getText({ blockSeparator: '\n' }) })
