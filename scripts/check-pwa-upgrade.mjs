@@ -101,7 +101,7 @@ async function main() {
     const context = await browser.newContext()
     const page = await context.newPage()
     await page.goto(url)
-    await page.getByRole('heading', { name: '便签工具' }).waitFor()
+    await page.getByRole('heading', { name: '便签' }).first().waitFor()
     await page.evaluate(() => navigator.serviceWorker.ready)
     await page.reload()
     await page.waitForFunction(() => Boolean(navigator.serviceWorker.controller))
@@ -139,20 +139,27 @@ async function main() {
     const update = page.getByRole('button', { name: '更新并刷新' })
     await update.waitFor({ timeout: 20_000 })
     await Promise.all([page.waitForEvent('load'), update.click()])
-    await page.getByRole('heading', { name: '便签工具' }).waitFor()
+    await page.getByRole('heading', { name: '便签' }).first().waitFor()
     const newScript = await page.locator('script[type="module"]').first().getAttribute('src')
     assert.ok(newScript && newScript !== oldScript, '更新后仍加载旧版脚本')
     assert.deepEqual(await getProbe(page), { local: 'kept', indexed: 'kept' })
     await context.setOffline(true)
+    // The test has no real auth session, so online verification may close its
+    // local workspace. Reopen that same account offline to inspect persisted data.
+    await page.evaluate(() => {
+      localStorage.setItem('sticky-notes-last-account', JSON.stringify({
+        id: 'eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee', email: 'offline-upgrade@example.invalid'
+      }))
+    })
     await page.reload()
-    await page.getByRole('heading', { name: '便签工具' }).waitFor()
+    await page.getByRole('heading', { name: '便签' }).first().waitFor()
     assert.deepEqual(await getProbe(page), { local: 'kept', indexed: 'kept' })
     const restoredTitle = page.getByRole('textbox', { name: '便签标题' })
     await restoredTitle.waitFor()
     assert.equal(await restoredTitle.inputValue(), noteTitle)
     assert.match(await page.locator('.ProseMirror').textContent(), /升级前正文/)
-    await page.locator('.data-status-button').click()
-    await page.getByRole('dialog', { name: '数据与同步' }).getByText(/待同步 1 项/).waitFor({ timeout: 10_000 })
+    await page.getByTitle('打开数据与同步').first().click()
+    await page.getByRole('dialog', { name: '数据与同步' }).getByText(/还有 1 条改动/).waitFor({ timeout: 10_000 })
     console.log('PWA 跨版本更新、离线便签与浏览器存储保留：通过')
   } finally {
     try {
@@ -171,4 +178,3 @@ async function main() {
 }
 
 main().catch(error => { console.error(error); process.exitCode = 1 })
-
