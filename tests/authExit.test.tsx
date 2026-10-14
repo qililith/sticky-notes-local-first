@@ -26,7 +26,7 @@ vi.mock('../src/sync/engine', () => ({ startSync: () => undefined }))
 vi.mock('../src/components/PwaUpdatePrompt', () => ({ PwaUpdatePrompt: () => null }))
 
 import { App } from '../src/App'
-import { accountClearedEventKey } from '../src/data/accountSyncGate'
+import { accountClearedEventKey, accountSyncPausedKey } from '../src/data/accountSyncGate'
 import { beginEditorWrite, setUnresolvedEditorDraft } from '../src/data/saveGuard'
 
 beforeEach(() => {
@@ -96,17 +96,26 @@ it('continues listening for sign-out when the remembered workspace starts offlin
   await screen.findByRole('heading', { name: '欢迎使用' })
 })
 
-it('rechecks an offline-started account on reconnection and locks a missing session', async () => {
+it('checks an account even when navigator reports offline and locks an explicitly missing session', async () => {
   remembered.account = { id: 'account-a', email: 'a@example.test' }
   Object.defineProperty(navigator, 'onLine', { configurable: true, value: false })
   getUser.mockResolvedValueOnce({ data: { user: null }, error: { name: 'AuthSessionMissingError', status: 400 } })
   render(<App />)
-  await screen.findByRole('button', { name: '数据与同步' })
-  expect(getUser).not.toHaveBeenCalled()
-  Object.defineProperty(navigator, 'onLine', { configurable: true, value: true })
-  act(() => window.dispatchEvent(new Event('online')))
   await screen.findByRole('heading', { name: '欢迎使用' })
+  expect(getUser).toHaveBeenCalledOnce()
   expect(remembered.account).toBeNull()
+})
+
+it('rechecks the remembered account on pageshow and when the page becomes visible', async () => {
+  getUser.mockResolvedValueOnce({ data: { user: null }, error: { name: 'AuthRetryableFetchError', status: 0 } })
+  render(<App />)
+  await screen.findByRole('button', { name: '数据与同步' })
+  expect(getUser).toHaveBeenCalledTimes(1)
+  act(() => window.dispatchEvent(new Event('pageshow')))
+  await waitFor(() => expect(getUser).toHaveBeenCalledTimes(2))
+  Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' })
+  act(() => document.dispatchEvent(new Event('visibilitychange')))
+  await waitFor(() => expect(getUser).toHaveBeenCalledTimes(3))
 })
 
 it('retries a temporary auth failure on focus without reloading local data', async () => {
@@ -171,6 +180,13 @@ it('locks another tab after this account is cleared elsewhere', async () => {
   render(<App />)
   await screen.findByRole('button', { name: '数据与同步' })
   act(() => window.dispatchEvent(new StorageEvent('storage', { key: accountClearedEventKey('account-a'), newValue: 'cleared' })))
+  await screen.findByRole('heading', { name: '欢迎使用' })
+})
+
+it('locks another tab as soon as clearing pauses synchronization', async () => {
+  render(<App />)
+  await screen.findByRole('button', { name: '数据与同步' })
+  act(() => window.dispatchEvent(new StorageEvent('storage', { key: accountSyncPausedKey('account-a'), newValue: '1' })))
   await screen.findByRole('heading', { name: '欢迎使用' })
 })
 

@@ -5,9 +5,10 @@ import { toast, Toaster } from 'sonner'
 import type { User as AuthUser } from '@supabase/supabase-js'
 import { accountKey, demoMode, forgetAccount, getRememberedAccount, rememberAccount, supabase } from './auth'
 import { db } from './data/db'
-import { accountClearedEventKey, isAccountSyncPaused, resumeAccountSync } from './data/accountSyncGate'
+import { accountClearedEventKey, accountSyncPausedKey, isAccountSyncPaused, resumeAccountSync } from './data/accountSyncGate'
 import { MAX_FOLDER_NAME_LENGTH } from './data/limits'
 import { hasPendingEditorWrites, hasUnresolvedEditorDraft, setUnresolvedEditorDraft, subscribeEditorSafety } from './data/saveGuard'
+import { cleanupExpiredRecoveryDrafts } from './data/recoveryDraft'
 import { createFolder, createNote, createNoteWithContent, deleteFolder, reorderFolders, setNoteContent, updateFolder, updateNote } from './data/repository'
 import type { Note, RichText } from './data/types'
 import { startSync } from './sync/engine'
@@ -147,6 +148,7 @@ function NotesWorkspace({ account, onLogout, sessionEnded, onDiscardDraft }: { a
   const rejectedCount = outbox.filter(item => item.state === 'rejected').length
   const conflicts = useLiveQuery(() => db.conflicts.where('ownerId').equals(account.id).toArray(), [account.id], []) ?? []
   const syncError = useLiveQuery(() => db.syncMeta.get(account.id), [account.id])?.lastError ?? null
+  useEffect(() => { cleanupExpiredRecoveryDrafts(account.id) }, [account.id])
   const selectedNote = notes.find(note => note.id === noteId) ?? null
   const currentNote = selectedNote && (!selectedNote.deletedAt || hasUnsavedDraft || hasPendingEditorWrites()) ? selectedNote : null
   const currentNoteHasConflict = Boolean(currentNote && conflicts.some(item => item.entity === 'note' && item.entityId === currentNote.id))
@@ -337,8 +339,9 @@ export function App() {
     const clearedElsewhere = (event: StorageEvent) => {
       const current = accountRef.current
       const cleared = current && event.key === accountClearedEventKey(current.id) && event.newValue
+      const paused = current && event.key === accountSyncPausedKey(current.id) && event.newValue === '1'
       const signedOut = event.key === accountKey && event.newValue === null && !getRememberedAccount()
-      if (!current || !cleared && !signedOut) return
+      if (!current || !cleared && !paused && !signedOut) return
       if (getRememberedAccount()?.id === current.id) forgetAccount()
       if (hasPendingEditorWrites() || hasUnresolvedEditorDraft()) setSessionEnded(true)
       else { setSessionEnded(false); setAccount(null) }
@@ -391,7 +394,7 @@ export function App() {
       setAccount(accountRef.current)
     }
     const verify = async () => {
-      if (!active || !navigator.onLine || !verificationAllowed || verificationPending) return
+      if (!active || !verificationAllowed || verificationPending) return
       const hint = getRememberedAccount()
       if (!hint || isAccountSyncPaused(hint.id)) return
       const revision = authRevision
@@ -410,6 +413,7 @@ export function App() {
       finally { if (requestId === verificationId) verificationPending = false }
     }
     const retry = () => { void verify() }
+    const retryWhenVisible = () => { if (document.visibilityState === 'visible') retry() }
     const signedIn = (user: AuthUser) => {
       authRevision += 1
       verificationId += 1
@@ -434,6 +438,8 @@ export function App() {
     retry()
     window.addEventListener('online', retry)
     window.addEventListener('focus', retry)
+    window.addEventListener('pageshow', retry)
+    document.addEventListener('visibilitychange', retryWhenVisible)
     const timer = window.setInterval(retry, 60_000)
     return () => {
       active = false
@@ -442,6 +448,8 @@ export function App() {
       window.clearInterval(timer)
       window.removeEventListener('online', retry)
       window.removeEventListener('focus', retry)
+      window.removeEventListener('pageshow', retry)
+      document.removeEventListener('visibilitychange', retryWhenVisible)
       subscription.subscription.unsubscribe()
     }
   }, [])

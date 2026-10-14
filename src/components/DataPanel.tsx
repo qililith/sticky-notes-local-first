@@ -1,14 +1,17 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import Dexie from 'dexie'
 import { useLiveQuery } from 'dexie-react-hooks'
 import { toast } from 'sonner'
 import { supabase } from '../auth'
 import { downloadBackup, importBackup, MAX_BACKUP_BYTES, OVERSIZE_BACKUP_MESSAGE, parseBackup, type BackupArchive } from '../data/backup'
 import { db } from '../data/db'
+import { sameStructuredValue } from '../data/equality'
 import { HISTORY_PAGE_SIZE, historyCloudTime, historyPreview } from '../data/historyView'
-import { clearAccountFromDevice, restoreNoteRevision, updateNote } from '../data/repository'
+import { clearAccountFromDevice, createNoteWithContent, restoreNoteRevision, updateNote } from '../data/repository'
 import { hasPendingEditorWrites, hasUnresolvedEditorDraft } from '../data/saveGuard'
 import type { Note } from '../data/types'
+import { titleWithSuffix } from '../data/limits'
+import { clearRecoveryDraft, listAccountRecoveryDrafts, type RecoveryDraft } from '../data/recoveryDraft'
 import { resolveConflict, syncOnce } from '../sync/engine'
 import { downloadBatchExport, type BatchExportKind } from '../data/batchExport'
 import { estimateAccountStorage, formatStorageBytes, persistenceLabel, recordPersistence, type AccountStorageEstimate } from '../data/storageUsage'
@@ -28,6 +31,7 @@ export function DataPanel({ ownerId, note, currentFolderId, hasUnsavedDraft, onC
   const [online, setOnline] = useState(navigator.onLine)
   const [historyPages, setHistoryPages] = useState(1)
   const [storage, setStorage] = useState<AccountStorageEstimate | null>(null)
+  const [recoveryDrafts, setRecoveryDrafts] = useState(() => listAccountRecoveryDrafts(ownerId))
   const [exportScope, setExportScope] = useState(currentFolderId ?? '__all__')
   const [exportKind, setExportKind] = useState<BatchExportKind>('md-zip')
   useEffect(() => {
@@ -54,6 +58,10 @@ export function DataPanel({ ownerId, note, currentFolderId, hasUnsavedDraft, onC
   const folders = useLiveQuery(() => db.folders.where('ownerId').equals(ownerId).toArray(), [ownerId], []) ?? []
   const notes = useLiveQuery(() => db.notes.where('ownerId').equals(ownerId).toArray(), [ownerId], []) ?? []
   const activeNoteCount = notes.filter(item => !item.deletedAt).length
+  const unmatchedRecoveryDrafts = useMemo(() => recoveryDrafts.filter(draft => {
+    const saved = notes.find(item => item.id === draft.noteId)
+    return !saved || saved.title !== draft.title || saved.plainText !== draft.plainText || !sameStructuredValue(saved.doc, draft.doc)
+  }), [notes, recoveryDrafts])
   const exportCount = notes.filter(item => !item.deletedAt && (exportScope === '__all__' || item.folderId === (exportScope === '__unfiled__' ? null : exportScope))).length
 
   const run = async (task: () => Promise<unknown>, success: string) => {
@@ -79,8 +87,8 @@ export function DataPanel({ ownerId, note, currentFolderId, hasUnsavedDraft, onC
     ? '现在是本地演示，内容只留在这台设备，不会同步到其他设备。'
     : !online
       ? pending.length
-        ? `目前没有网络。还有 ${pending.length} 条改动保存在这台设备，连网后会同步。`
-        : '目前没有网络。已保存的内容可以继续查看和编辑。'
+        ? `浏览器显示可能离线。还有 ${pending.length} 条改动保存在这台设备；你仍可立即尝试同步。`
+        : '浏览器显示可能离线。已保存的内容可以继续查看和编辑，也可以立即尝试同步。'
       : conflicts.length
         ? `有 ${conflicts.length} 条内容和另一台设备不一致，请在下面选择保留哪一边。`
         : rejected.length
@@ -99,7 +107,7 @@ export function DataPanel({ ownerId, note, currentFolderId, hasUnsavedDraft, onC
         <p>{syncSummary}</p>
         {meta?.lastError && rejected.length === 0 && conflicts.length === 0 && <p className="panel-error">{meta.lastError}</p>}
         <p>这台设备上有 {activeNoteCount} 条便签。</p>
-        {supabase && <button type="button" disabled={busy || !online} onClick={() => void run(async () => { if (!await syncOnce(ownerId)) throw new Error('同步还没完成，请查看上面的说明') }, '同步完成')}>立即重试同步</button>}
+        {supabase && <button type="button" disabled={busy} onClick={() => void run(async () => { if (!await syncOnce(ownerId)) throw new Error('同步还没完成，请查看上面的说明') }, '同步完成')}>立即重试同步</button>}
       </section>
       {(rejected.length > 0 || conflicts.length > 0) && <section>
         <h3>需要你处理</h3>
@@ -113,7 +121,7 @@ export function DataPanel({ ownerId, note, currentFolderId, hasUnsavedDraft, onC
             <button type="button" disabled={busy || hasUnsavedDraft || conflicts.some(conflict => conflict.entity === item.entity && conflict.entityId === item.entityId)} onClick={() => void run(async () => {
               if (hasPendingEditorWrites() || hasUnresolvedEditorDraft()) throw new Error('请先保存或另存当前草稿')
               await updateNote(ownerId, item.entityId, { folderId: null })
-              if (supabase && online && !await syncOnce(ownerId)) throw new Error('已移到未分类，但同步还没完成')
+              if (supabase && !await syncOnce(ownerId)) throw new Error('已移到未分类，但同步还没完成')
             }, '已移到未分类')}>移到未分类并重试</button>
           </> : <p>按上面的说明改这一条后，再点同步。其他便签不受影响。</p>}
         </div>)}
@@ -124,6 +132,24 @@ export function DataPanel({ ownerId, note, currentFolderId, hasUnsavedDraft, onC
           <details><summary>其他设备上的内容</summary><pre>{'plainText' in item.remote ? item.remote.plainText : item.remote.name}</pre></details>
           <button type="button" disabled={busy || hasUnsavedDraft} onClick={() => { if (confirm('用这台设备的内容覆盖其他设备？')) void run(() => resolveConflict(ownerId, item.id, 'local'), '已保留这台设备的内容') }}>保留这台设备的</button>
           <button type="button" disabled={busy || hasUnsavedDraft} onClick={() => { if (confirm('用其他设备的内容替换这台设备上的？')) void run(() => resolveConflict(ownerId, item.id, 'remote'), '已采用其他设备的内容') }}>采用其他设备的</button>
+        </div>)}
+      </section>}
+      {unmatchedRecoveryDrafts.length > 0 && <section>
+        <h3>本机临时恢复草稿</h3>
+        <p>这些内容只存在于当前浏览器，最多保留 24 小时。恢复会另存为新便签，不会覆盖现有内容。</p>
+        {unmatchedRecoveryDrafts.map((draft: RecoveryDraft) => <div className="panel-card" key={`${draft.noteId}:${draft.token}`}>
+          <p>{draft.title || '无标题'} · 保存于 {formatTime(draft.savedAt)}</p>
+          <details><summary>查看草稿内容</summary><pre>{draft.plainText}</pre></details>
+          <button type="button" disabled={busy} onClick={() => void run(async () => {
+            await createNoteWithContent(ownerId, null, titleWithSuffix(draft.title, '（恢复副本）'), draft.doc, draft.plainText)
+            clearRecoveryDraft(ownerId, draft.noteId, draft.token)
+            setRecoveryDrafts(current => current.filter(item => item.noteId !== draft.noteId || item.token !== draft.token))
+          }, '草稿已另存为新便签')}>恢复为新便签</button>
+          <button type="button" disabled={busy} onClick={() => {
+            if (!confirm('删除这份本机临时草稿？此操作不能撤销。')) return
+            clearRecoveryDraft(ownerId, draft.noteId, draft.token)
+            setRecoveryDrafts(current => current.filter(item => item.noteId !== draft.noteId || item.token !== draft.token))
+          }}>删除草稿</button>
         </div>)}
       </section>}
       <section>

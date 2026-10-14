@@ -4,12 +4,14 @@ import { closeHistory } from '@tiptap/pm/history'
 import { Fragment, Slice } from '@tiptap/pm/model'
 import { toast } from 'sonner'
 import { createEditorExtensions } from '../data/editorSchema'
+import { sameStructuredValue } from '../data/equality'
 import { ArrowLeft, Bold, Check, CheckSquare, ChevronDown, ChevronLeft, ChevronRight, Database, Download, FileText, FolderInput, Heading1, Heading2, Heading3, Highlighter, Italic, List, ListOrdered, Maximize2, Menu, Minimize2, Moon, PanelLeftOpen, Pin, Redo2, Sun, Trash2, Type, Undo2, X } from 'lucide-react'
 import type { Folder, Note, RichText } from '../data/types'
 import { MAX_TITLE_LENGTH, titleWithSuffix } from '../data/limits'
 import { beginEditorWrite } from '../data/saveGuard'
 import { downloadNoteExport, type NoteExportFormat } from '../data/noteExport'
 import { clearRecoveryDraft, readRecoveryDraft, writeRecoveryDraft } from '../data/recoveryDraft'
+import { drainLatestWrite } from '../data/latestWriteQueue'
 
 type Props = {
   note: Note | null
@@ -33,14 +35,19 @@ type Props = {
   onDelete?: () => void
 }
 
+const RECOVERY_DRAFT_INTERVAL_MS = 5000
+
 function EditorBody({ note, folders, onEdit, onSaveCopy, onDiscardError, onMoveFolder, onOpenSidebar, onOpenConflicts, localError, syncError, pendingCount, syncIssueCount, hasConflict, isMobile, theme, onToggleTheme, onBack, onPin, onDelete }: Props & { note: Note }) {
   const [title, setTitle] = useState(note.title)
   const titleRef = useRef(note.title)
   const titleInputRef = useRef<HTMLInputElement>(null)
   const [fullscreen, setFullscreen] = useState(false)
   const [wordCount, setWordCount] = useState(note.plainText.length)
-  const saveQueue = useRef<Promise<void>>(Promise.resolve())
-  const pendingWrites = useRef(0)
+  const queuedChange = useRef<{ doc: RichText; plainText: string; title: string } | null>(null)
+  const latestRecoveryChange = useRef<{ doc: RichText; plainText: string; title: string } | null>(null)
+  const recoveryWriteTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const recoveryToken = useRef<string | null>(null)
+  const saveQueueRunning = useRef(false)
   const expectedRev = useRef(note.localRev)
   const [saving, setSaving] = useState(false)
   const [externalChange, setExternalChange] = useState(false)
@@ -56,22 +63,62 @@ function EditorBody({ note, folders, onEdit, onSaveCopy, onDiscardError, onMoveF
   const mobileMenuRef = useRef<HTMLDialogElement>(null)
   const moreButtonRef = useRef<HTMLButtonElement>(null)
 
+  const persistRecoveryDraft = useCallback(() => {
+    if (recoveryWriteTimer.current !== null) clearTimeout(recoveryWriteTimer.current)
+    recoveryWriteTimer.current = null
+    const latest = latestRecoveryChange.current
+    if (!latest) return
+    recoveryToken.current = writeRecoveryDraft(note.ownerId, note.id, latest)
+  }, [note.id, note.ownerId])
+
+  useEffect(() => {
+    const flushRecovery = () => persistRecoveryDraft()
+    window.addEventListener('pagehide', flushRecovery)
+    window.addEventListener('beforeunload', flushRecovery)
+    return () => {
+      window.removeEventListener('pagehide', flushRecovery)
+      window.removeEventListener('beforeunload', flushRecovery)
+      persistRecoveryDraft()
+    }
+  }, [persistRecoveryDraft])
+
   const enqueue = useCallback((doc: RichText, plainText: string, nextTitle: string) => {
     const capturedId = note.id
-    const recoveryToken = writeRecoveryDraft(note.ownerId, capturedId, { doc, plainText, title: nextTitle })
-    pendingWrites.current += 1
+    const change = { doc, plainText, title: nextTitle }
+    queuedChange.current = change
+    latestRecoveryChange.current = change
+    if (recoveryWriteTimer.current === null) {
+      recoveryWriteTimer.current = setTimeout(persistRecoveryDraft, RECOVERY_DRAFT_INTERVAL_MS)
+    }
+    if (saveQueueRunning.current) return
+    saveQueueRunning.current = true
     const endWrite = beginEditorWrite()
     setSaving(true)
-    saveQueue.current = saveQueue.current.catch(() => undefined).then(async () => {
-      const saved = await onEdit(capturedId, { doc, plainText, title: nextTitle }, expectedRev.current)
-      expectedRev.current = saved.localRev
-      if (recoveryToken) clearRecoveryDraft(note.ownerId, capturedId, recoveryToken)
-    }).catch(() => undefined).finally(() => {
-      pendingWrites.current -= 1
+    void drainLatestWrite(
+      () => {
+        const next = queuedChange.current
+        queuedChange.current = null
+        return next
+      },
+      async next => {
+        try {
+          const saved = await onEdit(capturedId, next, expectedRev.current)
+          expectedRev.current = saved.localRev
+          if (!queuedChange.current) {
+            latestRecoveryChange.current = null
+            if (recoveryWriteTimer.current !== null) clearTimeout(recoveryWriteTimer.current)
+            recoveryWriteTimer.current = null
+            if (recoveryToken.current) clearRecoveryDraft(note.ownerId, capturedId, recoveryToken.current)
+            recoveryToken.current = null
+          }
+        } catch { /* onEdit reports the failure; keep the recovery draft for the user. */ }
+      }
+    ).finally(() => {
+      saveQueueRunning.current = false
       endWrite()
-      if (pendingWrites.current === 0) setSaving(false)
+      setSaving(false)
     })
-  }, [note.id, note.ownerId, onEdit])
+  }, [note.id, note.ownerId, onEdit, persistRecoveryDraft])
 
   const editor = useEditor({
     extensions: createEditorExtensions(),
@@ -196,7 +243,7 @@ function EditorBody({ note, folders, onEdit, onSaveCopy, onDiscardError, onMoveF
   const idleSaveStatus = !localError && !externalChange && !saving && !hasConflict && !syncError && !pendingCount
   const hasSaveIssue = Boolean(localError || externalChange || hasConflict || syncError || syncIssueCount)
   const hasRecoverableDraft = recoveryDraft && (recoveryDraft.title !== note.title
-    || recoveryDraft.plainText !== note.plainText || JSON.stringify(recoveryDraft.doc) !== JSON.stringify(note.doc))
+    || recoveryDraft.plainText !== note.plainText || !sameStructuredValue(recoveryDraft.doc, note.doc))
   useEffect(() => { editor?.setEditable(!hasRecoverableDraft) }, [editor, hasRecoverableDraft])
   const exportNote = (format: NoteExportFormat) => {
     if (!editor) return

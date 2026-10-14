@@ -1,4 +1,5 @@
 import { chromium, expect } from '@playwright/test'
+import { isDeepStrictEqual } from 'node:util'
 import { build, preview } from 'vite'
 
 // Called only by the opt-in cloud test runner. Admin keys never enter the browser.
@@ -103,11 +104,11 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
     await page.getByLabel('邮箱', { exact: true }).fill(account.email)
     await page.getByLabel('密码', { exact: true }).fill(account.password)
     await page.getByRole('button', { name: '登录', exact: true }).click()
-    await wait(page.getByRole('button', { name: '退出登录' })).toBeVisible()
+    await wait(page.locator('.app-layout')).toBeVisible()
   }
   async function openPanel(page) {
     const panel = page.getByRole('dialog', { name: '数据与同步' })
-    if (!await panel.isVisible()) await page.getByRole('button', { name: /^数据与同步/ }).click()
+    if (!await panel.isVisible()) await page.locator('.sync-status-button:visible').click()
     await wait(panel).toBeVisible()
     return panel
   }
@@ -115,6 +116,11 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
     const panel = page.getByRole('dialog', { name: '数据与同步' })
     if (await panel.isVisible()) await panel.getByRole('button', { name: '关闭', exact: true }).click()
     await wait(panel).not.toBeVisible()
+  }
+  async function logout(page) {
+    const panel = await openPanel(page)
+    await panel.getByRole('button', { name: '退出登录', exact: true }).click()
+    await wait(page.getByRole('button', { name: '登录', exact: true })).toBeVisible()
   }
   async function sync(page, ownerId = accounts[0].id) {
     const panel = await openPanel(page)
@@ -128,6 +134,12 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
     await closePanel(page)
   }
   const item = (page, name = title) => page.locator('.note-item').filter({ has: page.getByRole('heading', { name, exact: true }) })
+  async function moveCurrentNote(page, folderName) {
+    await page.locator('.toolbar-folder-menu summary').click()
+    const menu = page.locator('.toolbar-folder-popover')
+    await wait(menu).toBeVisible()
+    await menu.getByRole('menuitemradio', { name: folderName, exact: true }).click()
+  }
   async function note(page, id) { return (await rows(page, 'notes')).find(row => row.id === id) }
   async function download(page) {
     const panel = await openPanel(page)
@@ -201,7 +213,7 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
       const deadline = originalExpiry * 1000 + 3_000
       check(Number.isFinite(deadline) && deadline > Date.now() && deadline - Date.now() < 7_200_000, 'Expected a real session expiring within two hours')
       await contexts[0].setOffline(true)
-      await a1.getByTitle('新建便签', { exact: true }).click()
+      await a1.getByTitle('新建便签', { exact: true }).first().click()
       await a1.getByLabel('便签标题', { exact: true }).fill(title)
       await a1.getByLabel('便签正文', { exact: true }).fill('自然到期期间离线保存的正文。')
       await wait.poll(async () => (await rows(a1, 'notes')).find(row => row.title === title)?.plainText).toBe('自然到期期间离线保存的正文。')
@@ -254,8 +266,9 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
       return
     }
 
-    step = 'Create through UI and exchange the note between browsers'
-    await a1.getByTitle('新建便签', { exact: true }).click()
+    step = 'Create a note through the first browser UI'
+    await a1.getByTitle('新建便签', { exact: true }).first().click()
+    step = 'Edit the new note through the first browser UI'
     await a1.getByLabel('便签标题', { exact: true }).fill(title)
     await a1.getByLabel('便签正文', { exact: true }).click()
     await a1.getByLabel('便签正文', { exact: true }).evaluate((element, text) => {
@@ -266,13 +279,19 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
     }, initialText)
     await wait.poll(async () => (await rows(a1, 'notes')).find(row => row.title === title)?.plainText).toBe(initialText)
     const noteId = (await rows(a1, 'notes')).find(row => row.title === title).id
+    step = 'Synchronize the new note from the first browser'
     await sync(a1)
+    step = 'Pull the new note into the second browser'
     await sync(a2)
+    check((await rows(a2, 'outbox')).length === 0, 'Pulling a note unexpectedly created a local upload')
+    step = 'Open the synchronized note in the second browser'
     await item(a2).click()
     await wait(a2.getByLabel('便签正文', { exact: true })).toContainText('真实网页登录后的第一段正文。')
     await wait(a2.getByLabel('便签正文', { exact: true })).toContainText('<div>按原样保存</div> &amp;  **星号**')
+    check((await rows(a2, 'outbox')).length === 0, 'Opening a synchronized note unexpectedly created a local upload')
     check((await note(a2, noteId))?.plainText === initialText, 'Pasted whitespace changed in the second browser')
-    check(JSON.stringify((await note(a2, noteId))?.doc) === JSON.stringify((await note(a1, noteId))?.doc), 'Pasted document changed during synchronization')
+    check(isDeepStrictEqual((await note(a2, noteId))?.doc, (await note(a1, noteId))?.doc), 'Pasted document changed during synchronization')
+    step = 'Confirm the other account cannot pull the note'
     await sync(b, accounts[1].id)
     await wait(item(b)).toHaveCount(0)
     check((await rows(b, 'notes', accounts[0].id)).length === 0, 'Other account leaked into browser storage')
@@ -282,26 +301,35 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
     for (const name of ['云端甲', '云端乙', '云端丙']) {
       await a1.getByTitle('新建文件夹').click()
       await a1.getByLabel('新文件夹名称').fill(name)
-      await a1.locator('.folder-create-form button[type="submit"]').click()
+      await a1.locator('.folder-create-form input').press('Enter')
       await wait.poll(async () => (await rows(a1, 'folders')).some(row => row.name === name)).toBe(true)
     }
     const folderRows = await rows(a1, 'folders')
     const firstFolder = folderRows.find(row => row.name === '云端甲')
     const thirdFolder = folderRows.find(row => row.name === '云端丙')
     check(firstFolder && thirdFolder, 'Created folders missing locally')
-    await a1.locator('.folder-item:not(.system-folder)').filter({ hasText: '云端丙' }).getByTitle('上移文件夹').click()
-    await wait.poll(async () => (await rows(a1, 'folders')).find(row => row.id === thirdFolder.id)?.sortOrder).toBe(1)
+    const firstFolderItem = a1.locator('.folder-item:not(.system-folder)').filter({ hasText: '云端甲' })
+    const thirdFolderItem = a1.locator('.folder-item:not(.system-folder)').filter({ hasText: '云端丙' })
+    step = 'Reorder folders through the UI on a real account'
+    await thirdFolderItem.dragTo(firstFolderItem)
+    await wait.poll(async () => (await rows(a1, 'folders')).filter(row => !row.deletedAt).sort((a, b) => a.sortOrder - b.sortOrder).map(row => row.name).join(',')).toBe('云端乙,云端甲,云端丙')
     const renamed = a1.locator('.folder-item:not(.system-folder)').filter({ hasText: '云端丙' })
+    step = 'Rename a folder through the UI on a real account'
     await renamed.getByTitle('重命名').click()
     await a1.getByLabel('重命名文件夹').fill('云端新分类')
-    await a1.getByTitle('保存文件夹名称').click()
+    await a1.getByLabel('重命名文件夹').press('Enter')
     await wait.poll(async () => (await rows(a1, 'folders')).find(row => row.id === thirdFolder.id)?.name).toBe('云端新分类')
-    await item(a1).getByRole('combobox', { name: `移动便签 ${title} 到文件夹` }).selectOption(thirdFolder.id)
+    step = 'Open All Notes before moving a note on a real account'
+    await a1.locator('.all-notes-item').click()
+    await wait(a1.getByLabel('便签标题', { exact: true })).toHaveValue(title)
+    step = 'Move a note through the editor folder menu on a real account'
+    await moveCurrentNote(a1, '云端新分类')
     await wait.poll(async () => (await note(a1, noteId))?.folderId).toBe(thirdFolder.id)
     await sync(a1)
     await sync(a2)
-    check((await rows(a2, 'folders')).filter(row => !row.deletedAt).sort((a, b) => a.sortOrder - b.sortOrder).map(row => row.name).join(',') === '云端甲,云端新分类,云端乙', 'Folder order or name did not reach the second browser')
+    check((await rows(a2, 'folders')).filter(row => !row.deletedAt).sort((a, b) => a.sortOrder - b.sortOrder).map(row => row.name).join(',') === '云端乙,云端甲,云端新分类', 'Folder order or name did not reach the second browser')
     check((await note(a2, noteId))?.folderId === thirdFolder.id, 'Moved note did not reach the second browser')
+    step = 'Delete a folder through the UI on a real account'
     await a1.locator('.folder-item:not(.system-folder)').filter({ hasText: '云端新分类' }).getByTitle('删除文件夹').click()
     await wait.poll(async () => (await note(a1, noteId))?.folderId).toBeNull()
     await sync(a1)
@@ -312,15 +340,15 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
 
     step = 'Move an older offline edit into a newer offline folder and synchronize both'
     await contexts[0].setOffline(true)
-    const moveNote = page => item(page).getByRole('combobox', { name: `移动便签 ${title} 到文件夹` })
-    await moveNote(a1).selectOption(firstFolder.id)
+    await item(a1).click()
+    await moveCurrentNote(a1, '云端甲')
     await wait.poll(async () => (await rows(a1, 'outbox')).some(row => row.entityId === noteId)).toBe(true)
     await a1.getByTitle('新建文件夹').click()
     await a1.getByLabel('新文件夹名称').fill('离线新分类')
-    await a1.locator('.folder-create-form button[type="submit"]').click()
+    await a1.locator('.folder-create-form input').press('Enter')
     await wait.poll(async () => (await rows(a1, 'folders')).some(row => row.name === '离线新分类')).toBe(true)
     const offlineFolder = (await rows(a1, 'folders')).find(row => row.name === '离线新分类')
-    await moveNote(a1).selectOption(offlineFolder.id)
+    await moveCurrentNote(a1, '离线新分类')
     await wait.poll(async () => (await note(a1, noteId))?.folderId).toBe(offlineFolder.id)
     await contexts[0].setOffline(false)
     await sync(a1)
@@ -333,12 +361,12 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
     await contexts[0].setOffline(true)
     const repairTitle = `受阻便签-${runId.slice(0, 8)}`
     const repairText = '这条尚无云端历史的便签，修复后正文必须保留。'
-    await a1.getByTitle('新建便签', { exact: true }).click()
+    await a1.getByTitle('新建便签', { exact: true }).first().click()
     await a1.getByLabel('便签标题', { exact: true }).fill(repairTitle)
     await a1.getByLabel('便签正文', { exact: true }).fill(repairText)
     await wait.poll(async () => (await rows(a1, 'notes')).find(row => row.title === repairTitle)?.plainText).toBe(repairText)
     const repairId = (await rows(a1, 'notes')).find(row => row.title === repairTitle).id
-    await item(a1, repairTitle).getByRole('combobox', { name: `移动便签 ${repairTitle} 到文件夹` }).selectOption(offlineFolder.id)
+    await moveCurrentNote(a1, '离线新分类')
     await wait.poll(async () => (await note(a1, repairId))?.folderId).toBe(offlineFolder.id)
     await a2.locator('.folder-item:not(.system-folder)').filter({ hasText: '离线新分类' }).getByTitle('删除文件夹').click()
     await sync(a2)
@@ -385,7 +413,7 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
     const refreshed = b.waitForResponse(response => response.url().startsWith(`${projectUrl}/auth/v1/token?`) && response.status() === 200)
     await b.reload()
     await refreshed
-    await wait(b.getByRole('button', { name: '退出登录' })).toBeVisible()
+    await wait(b.locator('.app-layout')).toBeVisible()
     await sync(b, accounts[1].id)
     pass('SDK expiry branch obtains a fresh real session and resumes sync (not a wall-clock JWT expiry test)')
 
@@ -433,7 +461,8 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
     const history = (await rows(a2, 'history')).find(row => row.noteId === noteId && row.snapshot.plainText === initialText)
     check(history, 'Initial confirmed history missing')
     const historyPanel = await openPanel(a2)
-    await historyPanel.locator('.panel-card').filter({ hasText: new RegExp(`版本 ${history.serverVersion}(?!\\d)`) }).getByRole('button', { name: '恢复', exact: true }).click()
+    const historyText = initialText.replace(/\s+/g, ' ').trim()
+    await historyPanel.locator('.panel-card').filter({ hasText: historyText.length <= 80 ? historyText : `${historyText.slice(0, 80)}…` }).first().getByRole('button', { name: '恢复', exact: true }).click()
     await wait.poll(async () => (await note(a2, noteId))?.plainText).toBe(initialText)
     await closePanel(a2)
     await sync(a2)
@@ -458,12 +487,12 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
     step = 'Sign out while offline with a saved but unsynced note'
     await contexts[0].setOffline(true)
     const draftTitle = `尚未上传-${runId.slice(0, 8)}`
-    await a1.getByTitle('新建便签', { exact: true }).click()
+    await a1.getByTitle('新建便签', { exact: true }).first().click()
     await a1.getByLabel('便签标题', { exact: true }).fill(draftTitle)
     await a1.getByLabel('便签正文', { exact: true }).fill('普通退出必须保留这条本地草稿。')
     await wait.poll(async () => (await rows(a1, 'notes')).find(row => row.title === draftTitle)?.plainText).toBe('普通退出必须保留这条本地草稿。')
     const draftId = (await rows(a1, 'notes')).find(row => row.title === draftTitle).id
-    await a1.getByRole('button', { name: '退出登录' }).click()
+    await logout(a1)
     await wait(a1.getByRole('button', { name: '登录', exact: true })).toBeVisible()
     await a1.reload()
     await wait(a1.getByRole('button', { name: '登录', exact: true })).toBeVisible()
@@ -477,7 +506,7 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
     check((await note(a1, draftId))?.title === draftTitle, 'Account switch removed previous local data')
     const unsynced = await readClient.from('notes').select('id').eq('id', draftId)
     check(!unsynced.error && unsynced.data.length === 0, 'Previous account queue uploaded while signed in as another account')
-    await a1.getByRole('button', { name: '退出登录' }).click()
+    await logout(a1)
     await login(a1, accounts[0])
     await sync(a1)
     await sync(a2)
@@ -490,14 +519,14 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
     pages.push(sibling)
     await sibling.goto(address)
     step = 'New sibling tab opens cached workspace before device clear'
-    await wait(sibling.getByRole('button', { name: '退出登录' })).toBeVisible()
+    await wait(sibling.locator('.app-layout')).toBeVisible()
     const clearPanel = await openPanel(a1)
     await clearPanel.getByRole('button', { name: '清除本机数据并退出' }).click()
     step = 'Device clear locks its initiating tab'
     await wait(a1.getByRole('button', { name: '登录', exact: true })).toBeVisible()
     step = 'Device clear locks its sibling tab'
     await wait(sibling.getByRole('button', { name: '登录', exact: true })).toBeVisible()
-    check((await rows(a1, 'notes')).length === 0 && (await rows(a1, 'outbox')).length === 0, 'Device clear left account rows behind')
+    await wait.poll(async () => `${(await rows(a1, 'notes')).length}:${(await rows(a1, 'outbox')).length}`).toBe('0:0')
     await sibling.reload()
     step = 'Cleared sibling stays locked after reload'
     await wait(sibling.getByRole('button', { name: '登录', exact: true })).toBeVisible()
@@ -546,7 +575,7 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
 
     step = 'Revoke only test-account B browser session while it has an unsynced note'
     await contexts[2].route(blockedDataApi, route => route.abort())
-    await b.getByTitle('新建便签', { exact: true }).click()
+    await b.getByTitle('新建便签', { exact: true }).first().click()
     const pendingTitle = `失效会话保留-${runId.slice(0, 8)}`
     await b.getByLabel('便签标题', { exact: true }).fill(pendingTitle)
     await b.getByLabel('便签正文', { exact: true }).fill('会话失效及账号禁用都不能删除这段未上传内容。')
@@ -588,20 +617,20 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
     // This tab was intentionally locked by the earlier device-clear test.
     await sibling.reload()
     await wait.poll(async () => await sibling.getByRole('heading', { name: '欢迎使用' }).isVisible() ||
-      await sibling.getByRole('button', { name: '退出登录' }).isVisible()).toBe(true)
+      await sibling.locator('.app-layout').isVisible()).toBe(true)
     if (await sibling.getByRole('heading', { name: '欢迎使用' }).isVisible()) await login(sibling, accounts[0])
-    await wait(sibling.getByRole('button', { name: '退出登录' })).toBeVisible()
+    await wait(sibling.locator('.app-layout')).toBeVisible()
     await sibling.evaluate(() => navigator.serviceWorker.ready)
     await sibling.reload()
     await sibling.waitForFunction(() => Boolean(navigator.serviceWorker.controller))
     const upgradeTitle = `升级待上传-${runId.slice(0, 8)}`
     const upgradeText = '应用更新后，这条尚未上传的正文仍需完整保留。'
-    await a1.getByTitle('新建便签', { exact: true }).click()
+    await a1.getByTitle('新建便签', { exact: true }).first().click()
     await a1.getByLabel('便签标题', { exact: true }).fill(upgradeTitle)
     await a1.getByLabel('便签正文', { exact: true }).fill(upgradeText)
     await wait.poll(async () => (await rows(a1, 'notes')).find(row => row.title === upgradeTitle)?.plainText).toBe(upgradeText)
     const upgradeId = (await rows(a1, 'notes')).find(row => row.title === upgradeTitle).id
-    await sibling.getByTitle('新建便签', { exact: true }).click()
+    await sibling.getByTitle('新建便签', { exact: true }).first().click()
     await sibling.getByLabel('便签标题', { exact: true }).fill(`升级失败草稿-${runId.slice(0, 8)}`)
     await sibling.getByLabel('便签正文', { exact: true }).fill('尚未发生错误时的原文。')
     await wait(sibling.locator('.sync-status-label')).toContainText('本地已保存')
@@ -671,8 +700,8 @@ export async function runCloudBrowserChecks({ accounts, readClient, runId, proje
     step = 'Check offline storage and real synchronization after the PWA upgrade'
     await contexts[0].setOffline(true)
     await Promise.all([a1.reload(), sibling.reload()])
-    await wait(a1.getByRole('button', { name: '退出登录' })).toBeVisible()
-    await wait(sibling.getByRole('button', { name: '退出登录' })).toBeVisible()
+    await wait(a1.locator('.app-layout')).toBeVisible()
+    await wait(sibling.locator('.app-layout')).toBeVisible()
     check((await note(a1, upgradeId))?.plainText === upgradeText, 'PWA upgrade lost the unsynced note')
     check((await rows(a1, 'notes')).some(row => row.plainText === failedDraft), 'PWA upgrade lost the recovered draft')
     const afterQueue = await rows(a1, 'outbox')

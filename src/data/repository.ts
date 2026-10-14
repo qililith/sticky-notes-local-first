@@ -1,14 +1,22 @@
 import { db } from './db'
+import { sameStructuredValue } from './equality'
 import { isAccountSyncPaused, notifyAccountCleared, pauseAccountSync, resumeAccountSync, withAccountSyncLock } from './accountSyncGate'
 import { checkedFolderName, checkedTitle, titleWithSuffix } from './limits'
 import { hasPendingEditorWrites, hasUnresolvedEditorDraft } from './saveGuard'
 import { recordPersistence } from './storageUsage'
 import { clearAccountRecoveryDrafts } from './recoveryDraft'
+import { notifySyncNeeded } from './syncSignal'
 import { emptyDocument, folderPayload, notePayload, type Entity, type Folder, type Mutation, type Note, type RichText } from './types'
 
 const now = () => new Date().toISOString()
 const id = () => crypto.randomUUID()
 let persistenceRequested = false
+
+async function writeAndWakeSync<T>(ownerId: string, write: () => Promise<T>): Promise<T> {
+  const result = await write()
+  notifySyncNeeded(ownerId)
+  return result
+}
 
 function requestPersistentStorage() {
   if (persistenceRequested || typeof navigator === 'undefined') return
@@ -60,11 +68,11 @@ export async function createNote(ownerId: string, folderId: string | null): Prom
     isPinned: false, createdAt: stamp, updatedAt: stamp, deletedAt: null,
     localRev: 1, serverVersion: 0, confirmedRev: 0
   }
-  await db.transaction('rw', db.notes, db.outbox, async () => {
+  await writeAndWakeSync(ownerId, () => db.transaction('rw', db.notes, db.outbox, async () => {
     requireWritableOwner(ownerId)
     await db.notes.add(note)
     await queueMutation('note', note)
-  })
+  }))
   requestPersistentStorage()
   return note
 }
@@ -74,11 +82,11 @@ export async function createNoteWithContent(ownerId: string, folderId: string | 
   checkedTitle(title)
   const stamp = now()
   const note: Note = { id: id(), ownerId, title, doc, docVersion: 1, plainText, folderId, isPinned: false, createdAt: stamp, updatedAt: stamp, deletedAt: null, localRev: 1, serverVersion: 0, confirmedRev: 0 }
-  await db.transaction('rw', db.notes, db.outbox, async () => {
+  await writeAndWakeSync(ownerId, () => db.transaction('rw', db.notes, db.outbox, async () => {
     requireWritableOwner(ownerId)
     await db.notes.add(note)
     await queueMutation('note', note)
-  })
+  }))
   requestPersistentStorage()
   return note
 }
@@ -91,7 +99,7 @@ export async function updateNote(
 ): Promise<Note> {
   requireOwner(ownerId)
   if (change.title !== undefined) checkedTitle(change.title)
-  return db.transaction('rw', db.notes, db.outbox, db.conflicts, async () => {
+  return writeAndWakeSync(ownerId, () => db.transaction('rw', db.notes, db.outbox, db.conflicts, async () => {
     requireWritableOwner(ownerId)
     const current = await db.notes.get(noteId)
     if (!current || current.ownerId !== ownerId) throw new Error('便签不存在')
@@ -99,14 +107,14 @@ export async function updateNote(
       throw new Error('便签已在其他窗口修改，请先检查最新内容')
     }
     if (Object.entries(change).every(([key, value]) =>
-      key === 'doc' ? JSON.stringify(current.doc) === JSON.stringify(value) : current[key as keyof Note] === value
+      key === 'doc' ? sameStructuredValue(current.doc, value) : current[key as keyof Note] === value
     )) return current
     const next = { ...current, ...change, localRev: current.localRev + 1, updatedAt: now() }
     await db.notes.put(next)
     await queueMutation('note', next)
     await refreshConflictLocal('note', next)
     return next
-  })
+  }))
 }
 
 export async function setNoteContent(ownerId: string, noteId: string, doc: RichText, plainText: string, title: string, expectedLocalRev?: number) {
@@ -125,7 +133,7 @@ export async function restoreNoteRevision(ownerId: string, noteId: string, revis
     }
     const snapshot = revision.snapshot
     if (current.title === snapshot.title && current.plainText === snapshot.plainText &&
-      JSON.stringify(current.doc) === JSON.stringify(snapshot.doc) && !current.deletedAt) return
+      sameStructuredValue(current.doc, snapshot.doc) && !current.deletedAt) return
     await createNoteWithContent(ownerId, current.folderId, titleWithSuffix(current.title, '（恢复前副本）'), current.doc, current.plainText)
     await updateNote(ownerId, noteId, {
       title: snapshot.title, doc: snapshot.doc, plainText: snapshot.plainText, deletedAt: null
@@ -137,7 +145,7 @@ export async function createFolder(ownerId: string, name: string): Promise<Folde
   requireOwner(ownerId)
   const trimmed = checkedFolderName(name)
   const stamp = now()
-  return db.transaction('rw', db.folders, db.outbox, async () => {
+  return writeAndWakeSync(ownerId, () => db.transaction('rw', db.folders, db.outbox, async () => {
     requireWritableOwner(ownerId)
     const folders = await db.folders.where('ownerId').equals(ownerId).toArray()
     const folder: Folder = {
@@ -149,12 +157,12 @@ export async function createFolder(ownerId: string, name: string): Promise<Folde
     await db.folders.add(folder)
     await queueMutation('folder', folder)
     return folder
-  })
+  }))
 }
 
 export async function updateFolder(ownerId: string, folderId: string, change: Partial<Pick<Folder, 'name' | 'sortOrder' | 'deletedAt'>>): Promise<Folder> {
   requireOwner(ownerId)
-  return db.transaction('rw', db.folders, db.outbox, db.conflicts, async () => {
+  return writeAndWakeSync(ownerId, () => db.transaction('rw', db.folders, db.outbox, db.conflicts, async () => {
     requireWritableOwner(ownerId)
     const current = await db.folders.get(folderId)
     if (!current || current.ownerId !== ownerId) throw new Error('文件夹不存在')
@@ -163,12 +171,12 @@ export async function updateFolder(ownerId: string, folderId: string, change: Pa
     await queueMutation('folder', next)
     await refreshConflictLocal('folder', next)
     return next
-  })
+  }))
 }
 
 export async function reorderFolders(ownerId: string, orderedIds: string[], expectedOrderIds: string[]): Promise<void> {
   requireOwner(ownerId)
-  await db.transaction('rw', db.folders, db.outbox, db.conflicts, async () => {
+  await writeAndWakeSync(ownerId, () => db.transaction('rw', db.folders, db.outbox, db.conflicts, async () => {
     requireWritableOwner(ownerId)
     const active = (await db.folders.where('ownerId').equals(ownerId).toArray()).filter(folder => !folder.deletedAt)
     if (orderedIds.length !== active.length || new Set(orderedIds).size !== active.length ||
@@ -187,12 +195,12 @@ export async function reorderFolders(ownerId: string, orderedIds: string[], expe
       await queueMutation('folder', next)
       await refreshConflictLocal('folder', next)
     }
-  })
+  }))
 }
 
 export async function deleteFolder(ownerId: string, folderId: string): Promise<void> {
   requireOwner(ownerId)
-  await db.transaction('rw', db.folders, db.notes, db.outbox, db.conflicts, async () => {
+  await writeAndWakeSync(ownerId, () => db.transaction('rw', db.folders, db.notes, db.outbox, db.conflicts, async () => {
     requireWritableOwner(ownerId)
     const folder = await db.folders.get(folderId)
     if (!folder || folder.ownerId !== ownerId) throw new Error('文件夹不存在')
@@ -201,18 +209,21 @@ export async function deleteFolder(ownerId: string, folderId: string): Promise<v
     await queueMutation('folder', nextFolder)
     await refreshConflictLocal('folder', nextFolder)
     await detachNotesFromFolder(ownerId, folderId)
-  })
+  }))
 }
 
 export async function detachNotesFromFolder(ownerId: string, folderId: string): Promise<void> {
   const notes = await db.notes.where('[ownerId+folderId]').equals([ownerId, folderId]).toArray()
+  let changed = false
   for (const note of notes) {
     if (note.ownerId !== ownerId) continue
     const nextNote = { ...note, folderId: null, localRev: note.localRev + 1, updatedAt: now() }
     await db.notes.put(nextNote)
     await queueMutation('note', nextNote)
     await refreshConflictLocal('note', nextNote)
+    changed = true
   }
+  if (changed) notifySyncNeeded(ownerId)
 }
 
 export async function clearAccountFromDevice(ownerId: string): Promise<void> {

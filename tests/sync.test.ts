@@ -3,13 +3,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 const rpc = vi.hoisted(() => vi.fn())
 const session = vi.hoisted(() => vi.fn())
 const headers = vi.hoisted(() => vi.fn())
+const signals = vi.hoisted(() => vi.fn())
 const authChange = vi.hoisted(() => vi.fn())
 const unsubscribe = vi.hoisted(() => vi.fn())
 vi.mock('../src/auth', () => ({ supabase: {
   auth: { getSession: session, onAuthStateChange: authChange },
-  rpc: (name: string, args: Record<string, unknown>) => ({
-    setHeader: (key: string, value: string) => { headers(key, value); return rpc(name, args) }
-  })
+  rpc: (name: string, args: Record<string, unknown>) => {
+    const builder = {
+      setHeader: (key: string, value: string) => { headers(key, value); return builder },
+      abortSignal: (signal: AbortSignal) => { signals(signal); return rpc(name, args) }
+    }
+    return builder
+  }
 } }))
 
 import { db } from '../src/data/db'
@@ -17,9 +22,11 @@ import { isAccountSyncPaused, resumeAccountSync } from '../src/data/accountSyncG
 import { clearAccountFromDevice, createFolder, createNote, setNoteContent, updateFolder, updateNote } from '../src/data/repository'
 import { emptyDocument } from '../src/data/types'
 import { beginEditorWrite, setUnresolvedEditorDraft } from '../src/data/saveGuard'
+import { notifySyncNeeded } from '../src/data/syncSignal'
 import { resolveConflict, startSync, syncOnce } from '../src/sync/engine'
 
 beforeEach(() => {
+  Object.defineProperty(navigator, 'onLine', { configurable: true, value: true })
   session.mockResolvedValue({ data: { session: { user: { id: 'account-a' }, access_token: 'token-a' } }, error: null })
   authChange.mockReturnValue({ data: { subscription: { unsubscribe } } })
 })
@@ -27,12 +34,20 @@ beforeEach(() => {
 afterEach(async () => {
   setUnresolvedEditorDraft(false)
   resumeAccountSync('account-a'); resumeAccountSync('account-b')
-  rpc.mockReset(); session.mockReset(); headers.mockReset()
+  rpc.mockReset(); session.mockReset(); headers.mockReset(); signals.mockReset()
   authChange.mockReset(); unsubscribe.mockReset()
   await Promise.all([db.notes.clear(), db.folders.clear(), db.outbox.clear(), db.conflicts.clear(), db.syncMeta.clear(), db.history.clear()])
+  Object.defineProperty(navigator, 'onLine', { configurable: true, value: true })
 })
 
 describe('sync sequencing', () => {
+  it('attempts a real sync even when navigator reports offline', async () => {
+    Object.defineProperty(navigator, 'onLine', { configurable: true, value: false })
+    rpc.mockResolvedValue({ data: { items: [], next: '0' }, error: null })
+    expect(await syncOnce('account-a')).toBe(true)
+    expect(rpc).toHaveBeenCalledWith('pull_changes', { p_after: '0', p_limit: 100 })
+  })
+
   it.each(['note', 'folder'] as const)('keeps a newer %s conflict when an older matching history entry is pulled', async entity => {
     const local = entity === 'note' ? await createNote('account-a', null) : await createFolder('account-a', '本机')
     const matching = { id: local.id, owner_id: 'account-a', version: 2, title: '', name: '本机',
@@ -188,6 +203,32 @@ describe('sync sequencing', () => {
       release({ data: { session: null }, error: new Error('Failed to fetch') })
       await vi.waitFor(() => expect(session).toHaveBeenCalledTimes(2))
       await vi.waitFor(async () => expect((await db.syncMeta.get('account-a'))?.lastError).toBeNull())
+    } finally { stop() }
+  })
+
+  it('debounces a durable local-write signal into a prompt sync attempt', async () => {
+    rpc.mockResolvedValue({ data: { items: [], next: '0' }, error: null })
+    const stop = startSync('account-a', { localWriteDelayMs: 5 })
+    try {
+      await vi.waitFor(() => expect(session).toHaveBeenCalledTimes(1))
+      notifySyncNeeded('account-b')
+      await new Promise(resolve => setTimeout(resolve, 15))
+      expect(session).toHaveBeenCalledTimes(1)
+      notifySyncNeeded('account-a')
+      notifySyncNeeded('account-a')
+      await vi.waitFor(() => expect(session).toHaveBeenCalledTimes(2))
+    } finally { stop() }
+  })
+
+  it('syncs again on pageshow and visibility changes', async () => {
+    rpc.mockResolvedValue({ data: { items: [], next: '0' }, error: null })
+    const stop = startSync('account-a')
+    try {
+      await vi.waitFor(() => expect(session).toHaveBeenCalledTimes(1))
+      window.dispatchEvent(new Event('pageshow'))
+      await vi.waitFor(() => expect(session).toHaveBeenCalledTimes(2))
+      document.dispatchEvent(new Event('visibilitychange'))
+      await vi.waitFor(() => expect(session).toHaveBeenCalledTimes(3))
     } finally { stop() }
   })
 
@@ -521,7 +562,7 @@ describe('sync sequencing', () => {
       } }, error: null }
     })
     expect(await syncOnce('account-a')).toBe(false)
-    expect(calls).toEqual([broken.id])
+    expect(calls).toEqual([broken.id, 'pull'])
     expect(await db.outbox.get(brokenMutation.id)).toMatchObject({ state: 'inflight' })
     expect(await db.outbox.where('entityId').equals(healthy.id).count()).toBe(1)
     expect((await db.syncMeta.get('account-a'))?.lastError).toContain('不匹配的记录')
@@ -554,16 +595,59 @@ describe('sync sequencing', () => {
     expect(requests.find(item => item.id !== mutation.id)).toMatchObject({ state: 'pending', payload: { plainText: '新内容' } })
   })
 
-  it('still stops the whole round on a network error', async () => {
+  it('preserves upload order but still pulls after a network upload error', async () => {
     const first = await createNote('account-a', null)
     await createNote('account-a', null)
     const firstMutation = (await db.outbox.where('entityId').equals(first.id).first())!
     await db.outbox.update(firstMutation.id, { createdAt: '2000-01-01T00:00:00.000Z' })
-    rpc.mockResolvedValue({ data: null, error: new Error('Failed to fetch') })
+    const calls: string[] = []
+    rpc.mockImplementation(async (name: string) => {
+      calls.push(name)
+      return name === 'pull_changes'
+        ? { data: { items: [], next: '0' }, error: null }
+        : { data: null, error: new Error('Failed to fetch') }
+    })
     expect(await syncOnce('account-a')).toBe(false)
-    expect(rpc).toHaveBeenCalledTimes(1)
+    expect(calls).toEqual(['apply_mutation', 'pull_changes'])
     expect((await db.outbox.get(firstMutation.id))?.state).toBe('inflight')
     expect(await db.outbox.where('ownerId').equals('account-a').count()).toBe(2)
+  })
+
+  it('times out an upload, releases the account lock, and retries the same frozen mutation', async () => {
+    const note = await createNote('account-a', null)
+    const mutation = (await db.outbox.where('entityId').equals(note.id).first())!
+    const sentIds: string[] = []
+    let uploadCalls = 0
+    rpc.mockImplementation(async (name: string, args: Record<string, unknown>) => {
+      if (name === 'pull_changes') return { data: { items: [], next: '0' }, error: null }
+      sentIds.push(String(args.p_mutation_id))
+      if (++uploadCalls === 1) return new Promise(() => undefined)
+      return { data: { status: 'ok', record: {
+        id: note.id, owner_id: 'account-a', title: '', doc: emptyDocument, doc_version: 1,
+        plain_text: '', folder_id: null, is_pinned: false, created_at: note.createdAt,
+        updated_at: note.updatedAt, deleted_at: null, version: 1
+      } }, error: null }
+    })
+
+    expect(await syncOnce('account-a', { requestTimeoutMs: 10 })).toBe(false)
+    expect((signals.mock.calls[0]?.[0] as AbortSignal).aborted).toBe(true)
+    expect(await db.outbox.get(mutation.id)).toMatchObject({ state: 'inflight', payload: mutation.payload })
+    expect((await db.syncMeta.get('account-a'))?.lastError).toContain('同步请求超时')
+    expect(await syncOnce('account-a', { requestTimeoutMs: 10 })).toBe(true)
+    expect(sentIds).toEqual([mutation.id, mutation.id])
+    expect(await db.outbox.get(mutation.id)).toBeUndefined()
+  })
+
+  it('times out a pull without holding the account lock for the next attempt', async () => {
+    let pullCalls = 0
+    rpc.mockImplementation(async (name: string) => {
+      if (name !== 'pull_changes') throw new Error('不应上行')
+      if (++pullCalls === 1) return new Promise(() => undefined)
+      return { data: { items: [], next: '0' }, error: null }
+    })
+    expect(await syncOnce('account-a', { requestTimeoutMs: 10 })).toBe(false)
+    expect(await syncOnce('account-a', { requestTimeoutMs: 10 })).toBe(true)
+    expect(pullCalls).toBe(2)
   })
 
   it('still stops the whole round on an authentication error', async () => {
