@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test'
 import { resolve } from 'node:path'
-import { notesDbStoresV1 } from '../src/data/dbSchema'
+import { notesDbStoresV1, notesDbStoresV2 } from '../src/data/dbSchema'
 
 test('a real IndexedDB version upgrade preserves notes, queue, conflicts, cursor and history', async ({ page }) => {
   // Use a localhost origin: browsers deny IndexedDB on the opaque about:blank origin.
@@ -9,7 +9,7 @@ test('a real IndexedDB version upgrade preserves notes, queue, conflicts, cursor
   await page.addScriptTag({ path: resolve('node_modules/dexie/dist/dexie.js') })
 
   const databaseName = `migration-fixture-${crypto.randomUUID()}`
-  const result = await page.evaluate(async ({ databaseName, storesV1 }) => {
+  const result = await page.evaluate(async ({ databaseName, storesV1, storesV2 }) => {
     const Dexie = (window as unknown as { Dexie: new (name: string) => any }).Dexie
     const note = (id: string, title: string, folderId: string | null, serverVersion: number) => ({
       id, ownerId: 'account-a', title, doc: { type: 'doc', content: [{ type: 'paragraph' }] },
@@ -53,22 +53,20 @@ test('a real IndexedDB version upgrade preserves notes, queue, conflicts, cursor
     const before = await readAll(oldDb)
     oldDb.close()
 
-    // Isolated, test-only v2 candidate: add an index without changing records.
-    // The production app remains at v1 until a separately approved migration.
-    const storesV2 = { ...storesV1, outbox: `${storesV1.outbox}, [ownerId+state]` }
+    // Production v2 adds an ordering index without rewriting records.
     const upgradedDb = new Dexie(databaseName)
     upgradedDb.version(1).stores(storesV1)
     upgradedDb.version(2).stores(storesV2)
     await upgradedDb.open()
     const after = await readAll(upgradedDb)
-    const outboxIndexes = upgradedDb.table('outbox').schema.indexes.map((index: { name: string }) => index.name)
+    const historyIndexes = upgradedDb.table('history').schema.indexes.map((index: { name: string }) => index.name)
     upgradedDb.close()
     await Dexie.delete(databaseName)
-    return { before, after, outboxIndexes }
-  }, { databaseName, storesV1: { ...notesDbStoresV1 } })
+    return { before, after, historyIndexes }
+  }, { databaseName, storesV1: { ...notesDbStoresV1 }, storesV2: { ...notesDbStoresV2 } })
 
   expect(result.after).toEqual(result.before)
-  expect(result.outboxIndexes).toContain('[ownerId+state]')
+  expect(result.historyIndexes).toContain('[ownerId+noteId+serverVersion]')
   expect(result.after.outbox.map(item => item.state).sort()).toEqual(['conflict', 'inflight', 'pending', 'rejected'])
   expect(result.after.conflicts).toHaveLength(1)
   expect(result.after.syncMeta[0].cursor).toBe('42')
