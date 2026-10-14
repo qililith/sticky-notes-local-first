@@ -1,4 +1,4 @@
-import { db } from './db'
+import { db, runWithDatabaseRecovery } from './db'
 import { sameStructuredValue } from './equality'
 import { isAccountSyncPaused, notifyAccountCleared, pauseAccountSync, resumeAccountSync, withAccountSyncLock } from './accountSyncGate'
 import { checkedFolderName, checkedTitle, titleWithSuffix } from './limits'
@@ -103,12 +103,12 @@ export async function updateNote(
     requireWritableOwner(ownerId)
     const current = await db.notes.get(noteId)
     if (!current || current.ownerId !== ownerId) throw new Error('便签不存在')
-    if (expectedLocalRev !== undefined && current.localRev !== expectedLocalRev) {
-      throw new Error('便签已在其他窗口修改，请先检查最新内容')
-    }
     if (Object.entries(change).every(([key, value]) =>
       key === 'doc' ? sameStructuredValue(current.doc, value) : current[key as keyof Note] === value
     )) return current
+    if (expectedLocalRev !== undefined && current.localRev !== expectedLocalRev) {
+      throw new Error('便签已在其他窗口修改，请先检查最新内容')
+    }
     const next = { ...current, ...change, localRev: current.localRev + 1, updatedAt: now() }
     await db.notes.put(next)
     await queueMutation('note', next)
@@ -118,7 +118,7 @@ export async function updateNote(
 }
 
 export async function setNoteContent(ownerId: string, noteId: string, doc: RichText, plainText: string, title: string, expectedLocalRev?: number) {
-  return updateNote(ownerId, noteId, { doc, plainText, title }, expectedLocalRev)
+  return runWithDatabaseRecovery(() => updateNote(ownerId, noteId, { doc, plainText, title }, expectedLocalRev))
 }
 
 export async function restoreNoteRevision(ownerId: string, noteId: string, revisionId: string): Promise<void> {

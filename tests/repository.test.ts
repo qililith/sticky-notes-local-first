@@ -55,6 +55,14 @@ describe('local data', () => {
     expect(await db.outbox.where('entityId').equals(note.id).count()).toBe(1)
   })
 
+  it('accepts a stale retry when the first save already committed the same content', async () => {
+    const note = await createNote('account-a', null)
+    const saved = await setNoteContent('account-a', note.id, emptyDocument, '正文', '标题', note.localRev)
+    const retried = await setNoteContent('account-a', note.id, emptyDocument, '正文', '标题', note.localRev)
+    expect(retried.localRev).toBe(saved.localRev)
+    expect(await db.outbox.where('entityId').equals(note.id).count()).toBe(1)
+  })
+
   it('signals sync only after a local note transaction succeeds', async () => {
     const owners: string[] = []
     const unsubscribe = subscribeSyncNeeded(ownerId => owners.push(ownerId))

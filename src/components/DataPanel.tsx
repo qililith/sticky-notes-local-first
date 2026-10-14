@@ -15,6 +15,7 @@ import { clearRecoveryDraft, listAccountRecoveryDrafts, type RecoveryDraft } fro
 import { resolveConflict, syncOnce } from '../sync/engine'
 import { downloadBatchExport, type BatchExportKind } from '../data/batchExport'
 import { estimateAccountStorage, formatStorageBytes, persistenceLabel, recordPersistence, type AccountStorageEstimate } from '../data/storageUsage'
+import { storageDiagnosticReport } from '../data/storageDiagnostics'
 
 type Props = { ownerId: string; note: Note | null; currentFolderId?: string | null; hasUnsavedDraft: boolean; onClose: () => void; onLogout: () => Promise<void>; onCleared: () => Promise<void> }
 
@@ -221,6 +222,7 @@ export function DataPanel({ ownerId, note, currentFolderId, hasUnsavedDraft, onC
       <section>
         <h3>这台设备</h3>
         <p>退出登录不会删掉这台设备上的内容。清除会删掉这台设备上的便签，其他设备不受影响。</p>
+        <button type="button" onClick={() => void navigator.clipboard.writeText(storageDiagnosticReport()).then(() => toast.success('诊断信息已复制')).catch(() => toast.error('复制失败'))}>复制本机诊断信息</button>
         <button type="button" disabled={busy || hasUnsavedDraft} onClick={() => void onLogout()}>退出登录</button>
         <button type="button" className="danger-action" disabled={busy || hasUnsavedDraft || ownerId !== 'local-demo' && (outbox.length > 0 || conflicts.length > 0)} onClick={() => {
           if (hasPendingEditorWrites()) { toast.error('请稍等，正在保存'); return }
