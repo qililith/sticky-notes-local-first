@@ -30,7 +30,7 @@ for (const rich of [false, true]) {
     await paste(page, text, rich ? '<p>网页中的格式化内容</p>' : undefined)
     await expect.poll(() => savedText(page)).toBe(normalized)
     await expect(page.getByLabel('便签正文', { exact: true }).locator('div, script, img, strong')).toHaveCount(0)
-    await expect(page.locator('.save-status')).toContainText('本地已保存')
+    await expect(page.locator('.sync-status-label')).toContainText('本地已保存')
     await page.reload()
     expect(await savedText(page)).toBe(normalized)
     await expect(page.getByLabel('便签正文', { exact: true })).toContainText('<div>中文</div> &amp; &#65;')
@@ -87,7 +87,7 @@ for (const format of [
     // trailing paragraph. Inspect leaf lines to distinguish those from paste loss.
     await expect(body.locator('p,h2')).toHaveText(['<保留>', '', '第二行', ''])
     await expect(body.locator(format.selector).first()).toHaveText('<保留>')
-    await expect(page.locator('.save-status')).toContainText('本地已保存')
+    await expect(page.locator('.sync-status-label')).toContainText('本地已保存')
     const beforeReload = await savedText(page)
     await page.reload()
     await expect(body.locator('p,h2')).toHaveText(['<保留>', '', '第二行', ''])
